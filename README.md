@@ -2,6 +2,8 @@
 
 Audio playback agents for Modular Agent. Plays audio data through system speakers.
 
+English | [日本語](README_ja.md)
+
 ## Features
 
 - **Audio Player** — Play audio data URIs through the default audio output device
@@ -13,7 +15,7 @@ Two changes to add this package to [`modular-agent-desktop`](https://github.com/
 1. **`modular-agent-desktop/src-tauri/Cargo.toml`** — add dependency:
 
    ```toml
-   modular-agent-audio = { path = "../../modular-agent-audio" }
+   modular-agent-audio = { git = "https://github.com/modular-agent/modular-agent-audio.git", tag = "v0.1.0" }
    ```
 
 2. **`modular-agent-desktop/src-tauri/src/lib.rs`** — add import:
@@ -60,6 +62,11 @@ Auto-detected by the decoder.
 ## Architecture
 
 Uses a dedicated OS thread with an `mpsc` channel for audio commands. This is necessary because `rodio::OutputStream` is `!Send + !Sync`. The agent communicates with the audio thread via `AudioCommand` messages (Play, SetVolume, Clear, Shutdown).
+
+## Key Dependencies
+
+- [rodio](https://crates.io/crates/rodio) — Audio playback and decoding
+- [base64](https://crates.io/crates/base64) — Data URI decoding
 
 ## License
 
