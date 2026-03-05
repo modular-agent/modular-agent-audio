@@ -55,13 +55,13 @@ Auto-detected by the decoder.
 
 ### Playback Behavior
 
-- Audio clips are queued and played sequentially (Sink queue)
+- Audio clips are queued and played sequentially (Player queue)
 - `interrupt=true` clears the queue before playing new audio
 - Volume is adjustable at runtime via config
 
 ## Architecture
 
-Uses a dedicated OS thread with an `mpsc` channel for audio commands. This is necessary because `rodio::OutputStream` is `!Send + !Sync`. The agent communicates with the audio thread via `AudioCommand` messages (Play, SetVolume, Clear, Shutdown).
+Uses a dedicated OS thread with an `mpsc` channel for audio playback isolation from the async runtime. The agent communicates with the audio thread via `AudioCommand` messages (Play, SetVolume, Clear, Shutdown).
 
 ## Key Dependencies
 

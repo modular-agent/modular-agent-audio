@@ -3,7 +3,7 @@ use modular_agent_core::{
     Agent, AgentContext, AgentData, AgentError, AgentSpec, AgentValue, AsAgent,
     ModularAgent, async_trait, modular_agent,
 };
-use rodio::{Decoder, OutputStream, Sink};
+use rodio::{Decoder, DeviceSinkBuilder, Player};
 use std::io::Cursor;
 use std::sync::Mutex;
 use std::sync::mpsc;
@@ -44,30 +44,27 @@ struct AudioPlayerAgent {
 }
 
 fn audio_thread(rx: mpsc::Receiver<AudioCommand>, initial_volume: f32) {
-    let (_stream, handle) = match OutputStream::try_default() {
+    let device_sink = match DeviceSinkBuilder::open_default_sink() {
         Ok(v) => v,
         Err(e) => {
             log::error!("No audio output device available: {}", e);
             return;
         }
     };
-    let sink = match Sink::try_new(&handle) {
-        Ok(v) => v,
-        Err(e) => {
-            log::error!("Failed to create audio sink: {}", e);
-            return;
-        }
-    };
-    sink.set_volume(initial_volume);
+    let player = Player::connect_new(device_sink.mixer());
+    player.set_volume(initial_volume);
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
             AudioCommand::Play(bytes) => match Decoder::new(Cursor::new(bytes)) {
-                Ok(source) => sink.append(source),
+                Ok(source) => player.append(source),
                 Err(e) => log::error!("Audio decode error: {}", e),
             },
-            AudioCommand::SetVolume(v) => sink.set_volume(v),
-            AudioCommand::Clear => sink.clear(),
+            AudioCommand::SetVolume(v) => player.set_volume(v),
+            AudioCommand::Clear => {
+                player.clear();
+                player.play();
+            }
             AudioCommand::Shutdown => break,
         }
     }
