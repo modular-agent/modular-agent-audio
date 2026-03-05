@@ -15,7 +15,7 @@ Modular Agent 用のオーディオ再生エージェント。システムスピ
 1. **`modular-agent-desktop/src-tauri/Cargo.toml`** — 依存関係を追加:
 
    ```toml
-   modular-agent-audio = { git = "https://github.com/modular-agent/modular-agent-audio.git", tag = "v0.1.0" }
+   modular-agent-audio = { git = "https://github.com/modular-agent/modular-agent-audio.git", tag = "v0.1.1" }
    ```
 
 2. **`modular-agent-desktop/src-tauri/src/lib.rs`** — インポートを追加:

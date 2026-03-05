@@ -15,7 +15,7 @@ Two changes to add this package to [`modular-agent-desktop`](https://github.com/
 1. **`modular-agent-desktop/src-tauri/Cargo.toml`** — add dependency:
 
    ```toml
-   modular-agent-audio = { git = "https://github.com/modular-agent/modular-agent-audio.git", tag = "v0.1.0" }
+   modular-agent-audio = { git = "https://github.com/modular-agent/modular-agent-audio.git", tag = "v0.1.1" }
    ```
 
 2. **`modular-agent-desktop/src-tauri/src/lib.rs`** — add import:
