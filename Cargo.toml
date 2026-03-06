@@ -1,6 +1,6 @@
 [package]
 name = "modular-agent-audio"
-version = "0.1.1"
+version = "0.2.0"
 description = "Audio Agents for Modular Agent"
 authors = ["Akira Ishino <akira@lumilab.jp>"]
 edition = "2024"
@@ -11,6 +11,24 @@ base64 = "0.22.1"
 log = "0.4"
 modular-agent-core = "0.23.1"
 rodio = "0.22"
+
+# Mic capture (optional)
+cpal = { version = "0.17", optional = true }
+rtrb = { version = "0.3", optional = true }
+
+# Transcription (optional)
+whisper-rs = { version = "0.15", optional = true }
+rubato = { version = "0.14", optional = true }
+
+[features]
+default = []
+capture = ["cpal", "rtrb"]
+transcribe = ["capture", "whisper-rs", "rubato"]
+_gpu = []
+transcribe-cuda = ["transcribe", "whisper-rs/cuda", "_gpu"]
+transcribe-vulkan = ["transcribe", "whisper-rs/vulkan", "_gpu"]
+transcribe-metal = ["transcribe", "whisper-rs/metal", "_gpu"]
+transcribe-coreml = ["transcribe", "whisper-rs/coreml", "_gpu"]
 
 # [patch.crates-io]
 # modular-agent-core = { path = "../modular-agent-core/modular-agent-core" }

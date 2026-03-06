@@ -1,7 +1,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use modular_agent_core::{
-    Agent, AgentContext, AgentData, AgentError, AgentSpec, AgentValue, AsAgent,
-    ModularAgent, async_trait, modular_agent,
+    Agent, AgentContext, AgentData, AgentError, AgentSpec, AgentValue, AsAgent, ModularAgent,
+    async_trait, modular_agent,
 };
 use rodio::{Decoder, DeviceSinkBuilder, Player};
 use std::io::Cursor;
