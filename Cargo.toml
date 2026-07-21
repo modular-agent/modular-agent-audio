@@ -9,7 +9,7 @@ license = "Apache-2.0 OR MIT"
 [dependencies]
 base64 = "0.22.1"
 log = "0.4"
-modular-agent-core = "0.24.0"
+modular-agent-core = "0.25.0"
 rodio = "0.22"
 
 # Mic capture (optional)
