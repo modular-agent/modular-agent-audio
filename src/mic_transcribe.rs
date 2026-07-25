@@ -91,9 +91,9 @@ fn resolve_device(device_id_str: &str) -> Result<cpal::Device, AgentError> {
             .default_input_device()
             .ok_or_else(|| AgentError::IoError("No default audio input device available".into()));
     }
-    let device_id: cpal::DeviceId = device_id_str
-        .parse()
-        .map_err(|e| AgentError::InvalidConfig(format!("Invalid device ID '{}': {}", device_id_str, e)))?;
+    let device_id: cpal::DeviceId = device_id_str.parse().map_err(|e| {
+        AgentError::InvalidConfig(format!("Invalid device ID '{}': {}", device_id_str, e))
+    })?;
     host.device_by_id(&device_id).ok_or_else(|| {
         let available: Vec<String> = host
             .input_devices()
@@ -101,7 +101,11 @@ fn resolve_device(device_id_str: &str) -> Result<cpal::Device, AgentError> {
             .map(|devs| {
                 devs.filter_map(|d| {
                     let id = d.id().ok()?;
-                    let name = d.description().ok().map(|desc| desc.name().to_string()).unwrap_or_default();
+                    let name = d
+                        .description()
+                        .ok()
+                        .map(|desc| desc.name().to_string())
+                        .unwrap_or_default();
                     Some(format!("{} ({})", id, name))
                 })
                 .collect()

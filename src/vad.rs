@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn test_force_split_at_max_duration() {
         let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 3); // 3 second max
-                                                            // Build 4s of speech with a quiet dip at 2.5s so the split point is predictable.
+        // Build 4s of speech with a quiet dip at 2.5s so the split point is predictable.
         let mut speech = tone(2500, 0.5, 440.0);
         speech.extend(tone(100, 0.02, 440.0)); // quiet 100ms at 2.5s
         speech.extend(tone(1400, 0.5, 440.0));
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn test_force_split_carries_over_remainder() {
         let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 2); // 2 second max
-                                                            // Feed 2.5 seconds of speech
+        // Feed 2.5 seconds of speech
         let speech = tone(2500, 0.5, 440.0);
         let mut first_split = None;
         for chunk in speech.chunks(160) {
