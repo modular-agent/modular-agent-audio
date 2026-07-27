@@ -9,7 +9,7 @@ license = "Apache-2.0 OR MIT"
 [dependencies]
 base64 = "0.22.1"
 log = "0.4"
-modular-agent-core = "0.25.0"
+modular-agent-core = "0.26.0"
 rodio = "0.22"
 
 # Mic capture (optional)
@@ -31,4 +31,4 @@ transcribe-metal = ["transcribe", "whisper-rs/metal", "_gpu"]
 transcribe-coreml = ["transcribe", "whisper-rs/coreml", "_gpu"]
 
 # [patch.crates-io]
-# modular-agent-core = { path = "../modular-agent-core/modular-agent-core" }
+# modular-agent-core = { path = "../modular-agent/crates/modular-agent-core" }
