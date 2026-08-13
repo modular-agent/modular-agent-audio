@@ -1,0 +1,12 @@
+name: modular-agent-audio
+description: Audio capture/transcription agents
+available_features:
+  - capture
+  - transcribe
+  - transcribe-cuda
+  - transcribe-vulkan
+  - transcribe-metal
+  - transcribe-coreml
+default_features:
+  - transcribe-cuda
+default_for: [desktop]
