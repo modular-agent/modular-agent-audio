@@ -1,6 +1,6 @@
-# Audio Agents for Modular Agent
+# Audio Modules for Modular Agent
 
-Modular Agent 用のオーディオ再生・デバイス列挙・音声文字起こしエージェント。
+Modular Agent 用のオーディオ再生・デバイス列挙・音声文字起こしモジュール。
 
 [English](README.md) | 日本語
 
@@ -53,7 +53,7 @@ Modular Agent 用のオーディオ再生・デバイス列挙・音声文字起
 
 データ URI 形式: `data:<mime>;base64,<data>`
 
-VoiceVox TTS エージェントの出力と互換性があります。
+VoiceVox TTS モジュールの出力と互換性があります。
 
 ### 対応フォーマット
 
@@ -90,11 +90,11 @@ VoiceVox TTS エージェントの出力と互換性があります。
 ]
 ```
 
-`id` はプラットフォーム固有のユニーク識別子で、再起動後も安定しています。この値を Mic Transcribe エージェントの `device` 設定に使用します。
+`id` はプラットフォーム固有のユニーク識別子で、再起動後も安定しています。この値を Mic Transcribe モジュールの `device` 設定に使用します。
 
 ## Mic Transcribe
 
-ソースエージェント (入力なし)。マイク音声をキャプチャし、エネルギーベースの VAD で発話を区間検出し、ローカル Whisper (whisper.cpp via whisper-rs) で文字起こしします。
+ソースモジュール (入力なし)。マイク音声をキャプチャし、エネルギーベースの VAD で発話を区間検出し、ローカル Whisper (whisper.cpp via whisper-rs) で文字起こしします。
 
 `transcribe` フィーチャーが必要です。
 

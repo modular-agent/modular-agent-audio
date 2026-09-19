@@ -1,5 +1,5 @@
 name: modular-agent-audio
-description: Audio capture/transcription agents
+description: Audio capture/transcription modules
 available_features:
   - capture
   - transcribe

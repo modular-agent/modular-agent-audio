@@ -1,6 +1,6 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use modular_agent_core::{
-    Agent, AgentContext, AgentData, AgentError, AgentSpec, AgentValue, AsAgent, ModularAgent,
+    AsModule, Error, ModularAgent, Module, ModuleContext, ModuleData, ModuleSpec, Result, Value,
     async_trait, modular_agent,
 };
 use rodio::{Decoder, DeviceSinkBuilder, Player};
@@ -37,8 +37,8 @@ enum AudioCommand {
     boolean_config(name = CONFIG_INTERRUPT, description = "Interrupt current playback when new audio arrives"),
     hint(color = 5, width = 1, height = 1),
 )]
-struct AudioPlayerAgent {
-    data: AgentData,
+struct AudioPlayerModule {
+    data: ModuleData,
     sender: Mutex<Option<mpsc::Sender<AudioCommand>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -72,31 +72,31 @@ fn audio_thread(rx: mpsc::Receiver<AudioCommand>, initial_volume: f32) {
 
 /// Parse a data URI and return the decoded bytes.
 /// Accepts format: `data:<mimetype>;base64,<data>`
-fn decode_data_uri(data_uri: &str) -> Result<Vec<u8>, AgentError> {
+fn decode_data_uri(data_uri: &str) -> Result<Vec<u8>> {
     let base64_data = data_uri
         .strip_prefix("data:")
         .and_then(|s| s.split_once(";base64,"))
         .map(|(_, data)| data)
         .ok_or_else(|| {
-            AgentError::InvalidValue("Expected data URI format: data:<mime>;base64,<data>".into())
+            Error::InvalidValue("Expected data URI format: data:<mime>;base64,<data>".into())
         })?;
 
     STANDARD
         .decode(base64_data)
-        .map_err(|e| AgentError::InvalidValue(format!("Failed to decode base64 audio data: {}", e)))
+        .map_err(|e| Error::InvalidValue(format!("Failed to decode base64 audio data: {}", e)))
 }
 
 #[async_trait]
-impl AsAgent for AudioPlayerAgent {
-    fn new(ma: ModularAgent, id: String, spec: AgentSpec) -> Result<Self, AgentError> {
+impl AsModule for AudioPlayerModule {
+    fn new(ma: ModularAgent, id: String, spec: ModuleSpec) -> Result<Self> {
         Ok(Self {
-            data: AgentData::new(ma, id, spec),
+            data: ModuleData::new(ma, id, spec),
             sender: Mutex::new(None),
             thread: Mutex::new(None),
         })
     }
 
-    async fn start(&mut self) -> Result<(), AgentError> {
+    async fn start(&mut self) -> Result<()> {
         let volume = self
             .configs()
             .ok()
@@ -109,7 +109,7 @@ impl AsAgent for AudioPlayerAgent {
         let handle = std::thread::Builder::new()
             .name("audio-player".into())
             .spawn(move || audio_thread(rx, volume))
-            .map_err(|e| AgentError::IoError(format!("Failed to spawn audio thread: {}", e)))?;
+            .map_err(|e| Error::IoError(format!("Failed to spawn audio thread: {}", e)))?;
 
         *self.sender.lock().unwrap() = Some(tx);
         *self.thread.lock().unwrap() = Some(handle);
@@ -117,7 +117,7 @@ impl AsAgent for AudioPlayerAgent {
         Ok(())
     }
 
-    async fn stop(&mut self) -> Result<(), AgentError> {
+    async fn stop(&mut self) -> Result<()> {
         let tx = self.sender.lock().unwrap().take();
         if let Some(tx) = tx {
             let _ = tx.send(AudioCommand::Shutdown);
@@ -129,7 +129,7 @@ impl AsAgent for AudioPlayerAgent {
         Ok(())
     }
 
-    fn configs_changed(&mut self) -> Result<(), AgentError> {
+    fn configs_changed(&mut self) -> Result<()> {
         let config = self.configs()?;
         let volume = config.get_number_or(CONFIG_VOLUME, 1.0).clamp(0.0, 1.0) as f32;
         let guard = self.sender.lock().unwrap();
@@ -139,18 +139,13 @@ impl AsAgent for AudioPlayerAgent {
         Ok(())
     }
 
-    async fn process(
-        &mut self,
-        _ctx: AgentContext,
-        _port: String,
-        value: AgentValue,
-    ) -> Result<(), AgentError> {
+    async fn process(&mut self, _ctx: ModuleContext, _port: String, value: Value) -> Result<()> {
         let data_uri = value.as_str().ok_or_else(|| {
-            AgentError::InvalidValue("Input must be a string containing a data URI".into())
+            Error::InvalidValue("Input must be a string containing a data URI".into())
         })?;
 
         if data_uri.is_empty() {
-            return Err(AgentError::InvalidValue("Input data URI is empty".into()));
+            return Err(Error::InvalidValue("Input data URI is empty".into()));
         }
 
         let audio_bytes = decode_data_uri(data_uri)?;

@@ -1,6 +1,6 @@
-# Audio Agents for Modular Agent
+# Audio Modules for Modular Agent
 
-Audio playback, device enumeration, and speech-to-text transcription agents for Modular Agent.
+Audio playback, device enumeration, and speech-to-text transcription modules for Modular Agent.
 
 English | [日本語](README_ja.md)
 
@@ -53,7 +53,7 @@ Plays audio data through system speakers. Accepts data URI strings, decodes and 
 
 Data URI format: `data:<mime>;base64,<data>`
 
-Compatible with VoiceVox TTS agent output.
+Compatible with VoiceVox TTS module output.
 
 ### Supported Formats
 
@@ -90,11 +90,11 @@ Requires the `capture` feature.
 ]
 ```
 
-The `id` is a platform-specific unique identifier stable across reboots. Use this value for the Mic Transcribe agent's `device` config.
+The `id` is a platform-specific unique identifier stable across reboots. Use this value for the Mic Transcribe module's `device` config.
 
 ## Mic Transcribe
 
-Source agent (no inputs). Captures microphone audio, segments speech with energy-based VAD, and transcribes using local Whisper (whisper.cpp via whisper-rs).
+Source module (no inputs). Captures microphone audio, segments speech with energy-based VAD, and transcribes using local Whisper (whisper.cpp via whisper-rs).
 
 Requires the `transcribe` feature.
 

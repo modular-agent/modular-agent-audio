@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use modular_agent_core::{
-    Agent, AgentContext, AgentData, AgentError, AgentSpec, AgentStatus, AgentValue, AsAgent,
-    ModularAgent, async_trait, modular_agent,
+    AsModule, Error, ModularAgent, Module, ModuleContext, ModuleData, ModuleSpec, ModuleStatus,
+    Result, Value, async_trait, modular_agent,
 };
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
@@ -40,7 +40,7 @@ fn get_whisper_context_map() -> &'static Mutex<BTreeMap<String, Arc<WhisperConte
     WHISPER_CONTEXT_MAP.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn get_or_load_whisper_context(model_path: &str) -> Result<Arc<WhisperContext>, AgentError> {
+fn get_or_load_whisper_context(model_path: &str) -> Result<Arc<WhisperContext>> {
     let mut map = get_whisper_context_map().lock().unwrap();
     if let Some(ctx) = map.get(model_path) {
         return Ok(ctx.clone());
@@ -52,7 +52,7 @@ fn get_or_load_whisper_context(model_path: &str) -> Result<Arc<WhisperContext>, 
         cfg!(feature = "_gpu")
     );
     let ctx = WhisperContext::new_with_params(model_path, params).map_err(|e| {
-        AgentError::IoError(format!(
+        Error::IoError(format!(
             "Failed to load Whisper model '{}': {}",
             model_path, e
         ))
@@ -62,21 +62,21 @@ fn get_or_load_whisper_context(model_path: &str) -> Result<Arc<WhisperContext>, 
     Ok(ctx)
 }
 
-fn get_model_path(ma: &ModularAgent) -> Result<String, AgentError> {
-    ma.get_global_configs(MicTranscribeAgent::DEF_NAME)
+fn get_model_path(ma: &ModularAgent) -> Result<String> {
+    ma.get_global_configs(MicTranscribeModule::DEF_NAME)
         .and_then(|cfg| cfg.get_string(CONFIG_MODEL_PATH).ok())
         .filter(|p| !p.is_empty())
         .ok_or_else(|| {
-            AgentError::InvalidConfig(
+            Error::InvalidConfig(
                 "Whisper model path not set. Download from https://huggingface.co/ggerganov/whisper.cpp/tree/main".into(),
             )
         })
 }
 
-fn emit_output(ma: &ModularAgent, agent_id: &str, port: &str, value: AgentValue) {
-    if let Err(e) = ma.try_send_agent_out(
-        agent_id.to_string(),
-        AgentContext::new(),
+fn emit_output(ma: &ModularAgent, module_id: &str, port: &str, value: Value) {
+    if let Err(e) = ma.try_send_module_out(
+        module_id.to_string(),
+        ModuleContext::new(),
         port.to_string(),
         value,
     ) {
@@ -84,15 +84,15 @@ fn emit_output(ma: &ModularAgent, agent_id: &str, port: &str, value: AgentValue)
     }
 }
 
-fn resolve_device(device_id_str: &str) -> Result<cpal::Device, AgentError> {
+fn resolve_device(device_id_str: &str) -> Result<cpal::Device> {
     let host = cpal::default_host();
     if device_id_str.is_empty() {
         return host
             .default_input_device()
-            .ok_or_else(|| AgentError::IoError("No default audio input device available".into()));
+            .ok_or_else(|| Error::IoError("No default audio input device available".into()));
     }
     let device_id: cpal::DeviceId = device_id_str.parse().map_err(|e| {
-        AgentError::InvalidConfig(format!("Invalid device ID '{}': {}", device_id_str, e))
+        Error::InvalidConfig(format!("Invalid device ID '{}': {}", device_id_str, e))
     })?;
     host.device_by_id(&device_id).ok_or_else(|| {
         let available: Vec<String> = host
@@ -111,7 +111,7 @@ fn resolve_device(device_id_str: &str) -> Result<cpal::Device, AgentError> {
                 .collect()
             })
             .unwrap_or_default();
-        AgentError::InvalidConfig(format!(
+        Error::InvalidConfig(format!(
             "Device with ID '{}' not found. Available: {:?}",
             device_id_str, available
         ))
@@ -125,7 +125,7 @@ fn process_vad_and_transcribe(
     language: &Arc<Mutex<String>>,
     min_volume: &Arc<Mutex<f32>>,
     ma: &ModularAgent,
-    agent_id: &str,
+    module_id: &str,
 ) {
     if let Some(utterance) = vad.process(samples) {
         let min_vol = *min_volume.lock().unwrap();
@@ -143,7 +143,7 @@ fn process_vad_and_transcribe(
         let lang = language.lock().unwrap().clone();
         match transcribe(whisper_state, &utterance, &lang) {
             Ok(text) if !text.is_empty() => {
-                emit_output(ma, agent_id, PORT_TEXT, AgentValue::string(&text));
+                emit_output(ma, module_id, PORT_TEXT, Value::string(&text));
             }
             Err(e) => {
                 log::error!("Whisper inference error: {}", e);
@@ -157,7 +157,7 @@ fn process_vad_and_transcribe(
 #[allow(clippy::too_many_arguments)]
 fn processing_thread(
     ma: ModularAgent,
-    agent_id: String,
+    module_id: String,
     device: cpal::Device,
     model_path: String,
     language: Arc<Mutex<String>>,
@@ -169,9 +169,9 @@ fn processing_thread(
     // Emit status
     emit_output(
         &ma,
-        &agent_id,
+        &module_id,
         PORT_STATUS,
-        AgentValue::string("recording_started"),
+        Value::string("recording_started"),
     );
 
     // Load whisper model (heavy operation, done on this thread)
@@ -180,9 +180,9 @@ fn processing_thread(
         Err(e) => {
             emit_output(
                 &ma,
-                &agent_id,
+                &module_id,
                 PORT_STATUS,
-                AgentValue::string(format!("error: {}", e)),
+                Value::string(format!("error: {}", e)),
             );
             return;
         }
@@ -192,9 +192,9 @@ fn processing_thread(
         Err(e) => {
             emit_output(
                 &ma,
-                &agent_id,
+                &module_id,
                 PORT_STATUS,
-                AgentValue::string(format!("error: failed to create whisper state: {}", e)),
+                Value::string(format!("error: failed to create whisper state: {}", e)),
             );
             return;
         }
@@ -206,9 +206,9 @@ fn processing_thread(
         Err(e) => {
             emit_output(
                 &ma,
-                &agent_id,
+                &module_id,
                 PORT_STATUS,
-                AgentValue::string(format!("error: {}", e)),
+                Value::string(format!("error: {}", e)),
             );
             return;
         }
@@ -251,9 +251,9 @@ fn processing_thread(
         Err(e) => {
             emit_output(
                 &ma,
-                &agent_id,
+                &module_id,
                 PORT_STATUS,
-                AgentValue::string(format!("error: {}", e)),
+                Value::string(format!("error: {}", e)),
             );
             return;
         }
@@ -262,9 +262,9 @@ fn processing_thread(
     if let Err(e) = stream.play() {
         emit_output(
             &ma,
-            &agent_id,
+            &module_id,
             PORT_STATUS,
-            AgentValue::string(format!("error: {}", e)),
+            Value::string(format!("error: {}", e)),
         );
         return;
     }
@@ -290,9 +290,9 @@ fn processing_thread(
             Err(e) => {
                 emit_output(
                     &ma,
-                    &agent_id,
+                    &module_id,
                     PORT_STATUS,
-                    AgentValue::string(format!("error: resampler init failed: {}", e)),
+                    Value::string(format!("error: resampler init failed: {}", e)),
                 );
                 return;
             }
@@ -329,9 +329,9 @@ fn processing_thread(
         {
             emit_output(
                 &ma,
-                &agent_id,
+                &module_id,
                 PORT_STATUS,
-                AgentValue::string(format!("error: {}", err)),
+                Value::string(format!("error: {}", err)),
             );
             break;
         }
@@ -396,7 +396,7 @@ fn processing_thread(
                                 &language,
                                 &min_volume,
                                 &ma,
-                                &agent_id,
+                                &module_id,
                             );
                         }
                     }
@@ -415,7 +415,7 @@ fn processing_thread(
                 &language,
                 &min_volume,
                 &ma,
-                &agent_id,
+                &module_id,
             );
         }
     }
@@ -424,9 +424,9 @@ fn processing_thread(
     drop(stream);
     emit_output(
         &ma,
-        &agent_id,
+        &module_id,
         PORT_STATUS,
-        AgentValue::string("recording_stopped"),
+        Value::string("recording_stopped"),
     );
 }
 
@@ -434,7 +434,7 @@ fn transcribe(
     state: &mut whisper_rs::WhisperState,
     samples: &[f32],
     language: &str,
-) -> Result<String, AgentError> {
+) -> Result<String> {
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_language(Some(language));
     params.set_print_special(false);
@@ -447,7 +447,7 @@ fn transcribe(
 
     state
         .full(params, samples)
-        .map_err(|e| AgentError::IoError(format!("Whisper inference failed: {}", e)))?;
+        .map_err(|e| Error::IoError(format!("Whisper inference failed: {}", e)))?;
 
     let n_segments = state.full_n_segments();
     let mut text = String::new();
@@ -479,8 +479,8 @@ fn transcribe(
     string_global_config(name = CONFIG_MODEL_PATH, description = "Path to Whisper GGML model file (e.g. ggml-medium.bin)"),
     hint(color = 5, width = 1, height = 1),
 )]
-struct MicTranscribeAgent {
-    data: AgentData,
+struct MicTranscribeModule {
+    data: ModuleData,
     cmd_tx: Mutex<Option<std::sync::mpsc::Sender<Command>>>,
     thread_handle: Mutex<Option<JoinHandle<()>>>,
     shared_vad_sensitivity: Arc<Mutex<f32>>,
@@ -489,10 +489,10 @@ struct MicTranscribeAgent {
 }
 
 #[async_trait]
-impl AsAgent for MicTranscribeAgent {
-    fn new(ma: ModularAgent, id: String, spec: AgentSpec) -> Result<Self, AgentError> {
+impl AsModule for MicTranscribeModule {
+    fn new(ma: ModularAgent, id: String, spec: ModuleSpec) -> Result<Self> {
         Ok(Self {
-            data: AgentData::new(ma, id, spec),
+            data: ModuleData::new(ma, id, spec),
             cmd_tx: Mutex::new(None),
             thread_handle: Mutex::new(None),
             shared_vad_sensitivity: Arc::new(Mutex::new(0.01)),
@@ -501,7 +501,7 @@ impl AsAgent for MicTranscribeAgent {
         })
     }
 
-    async fn start(&mut self) -> Result<(), AgentError> {
+    async fn start(&mut self) -> Result<()> {
         let config = self.configs()?;
         let enabled = config.get_bool_or(CONFIG_ENABLED, true);
         if !enabled {
@@ -511,7 +511,7 @@ impl AsAgent for MicTranscribeAgent {
         // Validate model path (file existence check only, actual loading on thread)
         let model_path = get_model_path(self.ma())?;
         if !std::path::Path::new(&model_path).exists() {
-            return Err(AgentError::InvalidConfig(format!(
+            return Err(Error::InvalidConfig(format!(
                 "Whisper model file not found: {}. Download from https://huggingface.co/ggerganov/whisper.cpp/tree/main",
                 model_path
             )));
@@ -532,7 +532,7 @@ impl AsAgent for MicTranscribeAgent {
         let device = resolve_device(&device_id)?;
 
         let ma = self.ma().clone();
-        let agent_id = self.id().to_string();
+        let module_id = self.id().to_string();
         let shared_language = self.shared_language.clone();
         let shared_vad_sensitivity = self.shared_vad_sensitivity.clone();
         let shared_min_volume = self.shared_min_volume.clone();
@@ -540,11 +540,11 @@ impl AsAgent for MicTranscribeAgent {
         let (tx, rx) = std::sync::mpsc::channel();
 
         let handle = std::thread::Builder::new()
-            .name(format!("mic-transcribe-{}", agent_id))
+            .name(format!("mic-transcribe-{}", module_id))
             .spawn(move || {
                 processing_thread(
                     ma,
-                    agent_id,
+                    module_id,
                     device,
                     model_path,
                     shared_language,
@@ -554,9 +554,7 @@ impl AsAgent for MicTranscribeAgent {
                     rx,
                 );
             })
-            .map_err(|e| {
-                AgentError::IoError(format!("Failed to spawn processing thread: {}", e))
-            })?;
+            .map_err(|e| Error::IoError(format!("Failed to spawn processing thread: {}", e)))?;
 
         *self.cmd_tx.lock().unwrap() = Some(tx);
         *self.thread_handle.lock().unwrap() = Some(handle);
@@ -564,7 +562,7 @@ impl AsAgent for MicTranscribeAgent {
         Ok(())
     }
 
-    async fn stop(&mut self) -> Result<(), AgentError> {
+    async fn stop(&mut self) -> Result<()> {
         let tx = self.cmd_tx.lock().unwrap().take();
         if let Some(tx) = tx {
             let _ = tx.send(Command::Shutdown);
@@ -576,8 +574,8 @@ impl AsAgent for MicTranscribeAgent {
         Ok(())
     }
 
-    fn configs_changed(&mut self) -> Result<(), AgentError> {
-        if *self.status() != AgentStatus::Start {
+    fn configs_changed(&mut self) -> Result<()> {
+        if *self.status() != ModuleStatus::Start {
             return Ok(());
         }
 
@@ -616,12 +614,7 @@ impl AsAgent for MicTranscribeAgent {
         Ok(())
     }
 
-    async fn process(
-        &mut self,
-        _ctx: AgentContext,
-        _port: String,
-        _value: AgentValue,
-    ) -> Result<(), AgentError> {
-        Ok(()) // no-op: source agent
+    async fn process(&mut self, _ctx: ModuleContext, _port: String, _value: Value) -> Result<()> {
+        Ok(()) // no-op: source module
     }
 }

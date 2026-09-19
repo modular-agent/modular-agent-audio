@@ -1,7 +1,7 @@
 use cpal::traits::{DeviceTrait, HostTrait};
 use modular_agent_core::{
-    AgentContext, AgentData, AgentError, AgentOutput, AgentSpec, AgentValue, AsAgent, ModularAgent,
-    async_trait, im, modular_agent,
+    AsModule, Error, ModularAgent, ModuleContext, ModuleData, ModuleOutput, ModuleSpec, Result,
+    Value, async_trait, im, modular_agent,
 };
 
 const CATEGORY: &str = "Audio";
@@ -20,41 +20,36 @@ const PORT_DEVICES: &str = "devices";
     outputs = [PORT_DEVICES],
     hint(color = 5),
 )]
-struct AudioDeviceListAgent {
-    data: AgentData,
+struct AudioDeviceListModule {
+    data: ModuleData,
 }
 
 #[async_trait]
-impl AsAgent for AudioDeviceListAgent {
-    fn new(ma: ModularAgent, id: String, spec: AgentSpec) -> Result<Self, AgentError> {
+impl AsModule for AudioDeviceListModule {
+    fn new(ma: ModularAgent, id: String, spec: ModuleSpec) -> Result<Self> {
         Ok(Self {
-            data: AgentData::new(ma, id, spec),
+            data: ModuleData::new(ma, id, spec),
         })
     }
 
-    async fn process(
-        &mut self,
-        ctx: AgentContext,
-        _port: String,
-        _value: AgentValue,
-    ) -> Result<(), AgentError> {
+    async fn process(&mut self, ctx: ModuleContext, _port: String, _value: Value) -> Result<()> {
         let host = cpal::default_host();
-        let devices = host.input_devices().map_err(|e| {
-            AgentError::IoError(format!("Failed to enumerate input devices: {}", e))
-        })?;
+        let devices = host
+            .input_devices()
+            .map_err(|e| Error::IoError(format!("Failed to enumerate input devices: {}", e)))?;
 
-        let device_list: im::Vector<AgentValue> = devices
+        let device_list: im::Vector<Value> = devices
             .filter_map(|d| {
                 let id = d.id().ok()?;
                 let desc = d.description().ok()?;
-                Some(AgentValue::object(im::hashmap! {
-                    "id".into() => AgentValue::string(id.to_string()),
-                    "name".into() => AgentValue::string(desc.name()),
+                Some(Value::object(im::hashmap! {
+                    "id".into() => Value::string(id.to_string()),
+                    "name".into() => Value::string(desc.name()),
                 }))
             })
             .collect();
 
-        self.output(ctx, PORT_DEVICES, AgentValue::array(device_list))
+        self.output(ctx, PORT_DEVICES, Value::array(device_list))
             .await
     }
 }
