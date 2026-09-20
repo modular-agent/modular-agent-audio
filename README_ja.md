@@ -109,6 +109,8 @@ VoiceVox TTS モジュールの出力と互換性があります。
 | vad_sensitivity | number | 0.01 | VAD 感度 (RMS 閾値、低いほど感度が高い) |
 | min_volume | number | 0.0 | Whisper に送る最低ピーク音量 (RMS)。これ未満の発話は破棄される。0 = 無効 |
 | max_segment_duration | integer | 25 | 最大セグメント長 (秒、Whisper 30秒制限) |
+| silence_duration_ms | integer | 800 | 発話終了と判定する末尾無音 (ミリ秒)。小さいほど早く確定するが文中で切れやすい。会話用途では 400〜500 |
+| partial_interval | number | 0.0 | 発話中に途中結果を出す間隔 (発話秒数)。0 = 無効。毎回直近 8 秒を再デコードするので、有効化 (0.5〜1.0) は GPU ビルドでのみ推奨 |
 
 ### グローバル設定
 
@@ -121,7 +123,10 @@ VoiceVox TTS モジュールの出力と互換性があります。
 ### ポート
 
 - **出力**: `text` — 検出された発話ごとの文字起こしテキスト
-- **出力**: `status` — 状態変化: `"recording_started"`, `"recording_stopped"`, `"error: ..."`
+- **出力**: `partial` — 発話中の途中結果。`partial_interval` 秒の発話ごとに出力
+- **出力**: `status` — 状態変化: `"recording_started"`, `"recording_stopped"`, `"error: ..."`,
+  `"dropped: transcription backlog"` (推論が追い付かず発話を破棄した),
+  `"overrun: input samples dropped"` (キャプチャ用リングバッファが溢れた)
 
 ### ループバックキャプチャ (Windows)
 
@@ -146,7 +151,7 @@ Windows では、マイクの代わりに出力デバイスで再生中の音を
 ## アーキテクチャ
 
 - **Audio Player**: 非同期ランタイムからの再生分離のため、`mpsc` チャネルを持つ専用 OS スレッドを使用。`AudioCommand` メッセージ (Play, SetVolume, Clear, Shutdown) で通信。
-- **Mic Transcribe**: OS スレッド + `rtrb` ロックフリーリングバッファによるリアルタイムオーディオコールバック安全性。cpal コールバック → rtrb → 処理スレッド → モノラル変換 → リサンプル (16kHz) → VAD → Whisper。ランタイム設定変更 (`vad_sensitivity`/`min_volume`/`language`) は `Arc<Mutex>` 経由。
+- **Mic Transcribe**: OS スレッド + `rtrb` ロックフリーリングバッファによるリアルタイムオーディオコールバック安全性。cpal コールバック → rtrb → 処理スレッド → モノラル変換 → リサンプル (16kHz) → VAD → ジョブキュー → 推論スレッド → Whisper。推論は別スレッドで走るため音声経路が止まらない。追い付かないときは入力サンプルを失う代わりに発話単位で破棄し、`status` に報告する。ランタイム設定変更 (`vad_sensitivity`/`min_volume`/`language`) は `Arc<Mutex>` 経由。
 
 ## 主要な依存クレート
 

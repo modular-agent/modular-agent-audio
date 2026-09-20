@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -16,6 +18,7 @@ const CATEGORY: &str = "Audio";
 const WHISPER_SAMPLE_RATE: u32 = 16000;
 
 const PORT_TEXT: &str = "text";
+const PORT_PARTIAL: &str = "partial";
 const PORT_STATUS: &str = "status";
 
 const CONFIG_ENABLED: &str = "enabled";
@@ -24,15 +27,27 @@ const CONFIG_LANGUAGE: &str = "language";
 const CONFIG_VAD_SENSITIVITY: &str = "vad_sensitivity";
 const CONFIG_MIN_VOLUME: &str = "min_volume";
 const CONFIG_MAX_SEGMENT_DURATION: &str = "max_segment_duration";
+const CONFIG_SILENCE_DURATION_MS: &str = "silence_duration_ms";
+const CONFIG_PARTIAL_INTERVAL: &str = "partial_interval";
 const CONFIG_MODEL_PATH: &str = "model_path";
 
 /// `device` value that selects the default output device as a WASAPI loopback source.
 const DEVICE_LOOPBACK: &str = "loopback";
 
+/// Seconds of the in-progress utterance re-decoded for each partial result.
+const PARTIAL_WINDOW_SECS: usize = 8;
+/// Inference jobs that may wait for the worker before new utterances are dropped.
+const INFER_QUEUE_DEPTH: usize = 3;
+
 enum Command {
     Pause,
     Resume,
     Shutdown,
+}
+
+enum InferJob {
+    Final(Vec<f32>),
+    Partial(Vec<f32>),
 }
 
 // WhisperContext cache (shared across instances, keyed by model path)
@@ -87,6 +102,10 @@ fn emit_output(ma: &ModularAgent, module_id: &str, port: &str, value: Value) {
     }
 }
 
+fn emit_status(ma: &ModularAgent, module_id: &str, status: impl Into<String>) {
+    emit_output(ma, module_id, PORT_STATUS, Value::string(status.into()));
+}
+
 fn resolve_device(device_id_str: &str) -> Result<cpal::Device> {
     let host = cpal::default_host();
     if device_id_str.is_empty() {
@@ -131,32 +150,133 @@ fn resolve_device(device_id_str: &str) -> Result<cpal::Device> {
     })
 }
 
-fn process_vad_and_transcribe(
-    samples: &[f32],
-    vad: &mut EnergyVad,
-    whisper_state: &mut whisper_rs::WhisperState,
-    language: &Arc<Mutex<String>>,
-    min_volume: &Arc<Mutex<f32>>,
-    ma: &ModularAgent,
-    module_id: &str,
-) {
-    if let Some(utterance) = vad.process(samples) {
-        let min_vol = *min_volume.lock().unwrap();
-        if min_vol > 0.0 {
-            let peak = EnergyVad::peak_rms(&utterance, WHISPER_SAMPLE_RATE);
-            if peak < min_vol {
-                log::debug!(
-                    "Utterance discarded: peak_rms {:.4} < min_volume {:.4}",
-                    peak,
-                    min_vol
-                );
-                return;
+/// Segments 16 kHz mono audio into utterances and hands them to the inference worker.
+struct SpeechPipeline {
+    ma: ModularAgent,
+    module_id: String,
+    vad: EnergyVad,
+    job_tx: SyncSender<InferJob>,
+    min_volume: Arc<Mutex<f32>>,
+    /// 0 disables partial results.
+    partial_interval_samples: usize,
+    samples_since_partial: usize,
+}
+
+impl SpeechPipeline {
+    fn feed(&mut self, samples_16k: &[f32]) {
+        if let Some(utterance) = self.vad.process(samples_16k) {
+            self.samples_since_partial = 0;
+            if self.passes_min_volume(&utterance) {
+                self.submit(InferJob::Final(utterance));
+            }
+            return;
+        }
+
+        if self.partial_interval_samples == 0 || !self.vad.is_speaking() {
+            self.samples_since_partial = 0;
+            return;
+        }
+        self.samples_since_partial += samples_16k.len();
+        if self.samples_since_partial >= self.partial_interval_samples {
+            self.samples_since_partial = 0;
+            let speech = self.vad.current_speech();
+            let window = speech
+                .len()
+                .min(PARTIAL_WINDOW_SECS * WHISPER_SAMPLE_RATE as usize);
+            self.submit(InferJob::Partial(speech[speech.len() - window..].to_vec()));
+        }
+    }
+
+    fn passes_min_volume(&self, utterance: &[f32]) -> bool {
+        let min_vol = *self.min_volume.lock().unwrap();
+        if min_vol <= 0.0 {
+            return true;
+        }
+        let peak = EnergyVad::peak_rms(utterance, WHISPER_SAMPLE_RATE);
+        if peak < min_vol {
+            log::debug!(
+                "Utterance discarded: peak_rms {:.4} < min_volume {:.4}",
+                peak,
+                min_vol
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Never blocks: the audio path must keep draining the ring buffer even
+    /// when inference falls behind, so a full queue drops the job instead.
+    fn submit(&self, job: InferJob) {
+        let is_final = matches!(job, InferJob::Final(_));
+        match self.job_tx.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) if is_final => {
+                log::warn!("Transcription backlog full; utterance dropped");
+                emit_status(&self.ma, &self.module_id, "dropped: transcription backlog");
+            }
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                log::error!("Inference worker has exited; utterance dropped");
             }
         }
+    }
+}
+
+/// A partial is only worth decoding while nothing newer is queued behind it.
+/// Skips ahead to the newest job, stopping at a Final so none is lost.
+fn skip_stale_partials(job_rx: &Receiver<InferJob>, mut job: InferJob) -> InferJob {
+    while matches!(job, InferJob::Partial(_)) {
+        match job_rx.try_recv() {
+            Ok(next) => job = next,
+            Err(_) => break,
+        }
+    }
+    job
+}
+
+fn whisper_n_threads() -> i32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() / 2)
+        .unwrap_or(2)
+        .clamp(2, 8) as i32
+}
+
+/// Inference worker: owns the Whisper state and decodes jobs from the processing thread.
+/// Reports the model load result through `ready_tx` before entering the loop.
+fn infer_thread(
+    ma: ModularAgent,
+    module_id: String,
+    model_path: String,
+    language: Arc<Mutex<String>>,
+    stopping: Arc<AtomicBool>,
+    ready_tx: SyncSender<Result<()>>,
+    job_rx: Receiver<InferJob>,
+) {
+    let mut whisper_state = match get_or_load_whisper_context(&model_path).and_then(|ctx| {
+        ctx.create_state()
+            .map_err(|e| Error::IoError(format!("Failed to create whisper state: {}", e)))
+    }) {
+        Ok(state) => state,
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    };
+    let _ = ready_tx.send(Ok(()));
+    let n_threads = whisper_n_threads();
+
+    while let Ok(job) = job_rx.recv() {
+        if stopping.load(Ordering::Relaxed) {
+            break;
+        }
+        let (port, samples) = match skip_stale_partials(&job_rx, job) {
+            InferJob::Final(samples) => (PORT_TEXT, samples),
+            InferJob::Partial(samples) => (PORT_PARTIAL, samples),
+        };
         let lang = language.lock().unwrap().clone();
-        match transcribe(whisper_state, &utterance, &lang) {
+        match transcribe(&mut whisper_state, &samples, &lang, n_threads) {
             Ok(text) if !text.is_empty() => {
-                emit_output(ma, module_id, PORT_TEXT, Value::string(&text));
+                emit_output(&ma, &module_id, port, Value::string(&text));
             }
             Err(e) => {
                 log::error!("Whisper inference error: {}", e);
@@ -166,52 +286,90 @@ fn process_vad_and_transcribe(
     }
 }
 
-/// Processing thread function.
-#[allow(clippy::too_many_arguments)]
-fn processing_thread(
-    ma: ModularAgent,
-    module_id: String,
+struct CaptureParams {
     device: cpal::Device,
-    model_path: String,
-    language: Arc<Mutex<String>>,
     vad_sensitivity: Arc<Mutex<f32>>,
     min_volume: Arc<Mutex<f32>>,
     max_segment_secs: u32,
-    cmd_rx: std::sync::mpsc::Receiver<Command>,
-) {
-    // Emit status
-    emit_output(
-        &ma,
-        &module_id,
-        PORT_STATUS,
-        Value::string("recording_started"),
-    );
+    silence_duration_ms: u32,
+    partial_interval_secs: f64,
+}
 
-    // Load whisper model (heavy operation, done on this thread)
-    let whisper_ctx = match get_or_load_whisper_context(&model_path) {
-        Ok(ctx) => ctx,
+/// Processing thread: spawns the inference worker, then captures until told to stop.
+fn processing_thread(
+    ma: ModularAgent,
+    module_id: String,
+    model_path: String,
+    language: Arc<Mutex<String>>,
+    params: CaptureParams,
+    cmd_rx: Receiver<Command>,
+) {
+    emit_status(&ma, &module_id, "recording_started");
+
+    let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<InferJob>(INFER_QUEUE_DEPTH);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
+    let stopping = Arc::new(AtomicBool::new(false));
+
+    let worker = {
+        let ma = ma.clone();
+        let module_id = module_id.clone();
+        let stopping = stopping.clone();
+        std::thread::Builder::new()
+            .name(format!("mic-transcribe-infer-{}", module_id))
+            .spawn(move || {
+                infer_thread(
+                    ma, module_id, model_path, language, stopping, ready_tx, job_rx,
+                )
+            })
+    };
+    let worker = match worker {
+        Ok(handle) => handle,
         Err(e) => {
-            emit_output(
+            emit_status(
                 &ma,
                 &module_id,
-                PORT_STATUS,
-                Value::string(format!("error: {}", e)),
+                format!("error: failed to spawn inference thread: {}", e),
             );
             return;
         }
     };
-    let mut whisper_state = match whisper_ctx.create_state() {
-        Ok(s) => s,
-        Err(e) => {
-            emit_output(
-                &ma,
-                &module_id,
-                PORT_STATUS,
-                Value::string(format!("error: failed to create whisper state: {}", e)),
-            );
-            return;
-        }
-    };
+
+    // `job_tx` moves into the capture loop (or is dropped with the unused
+    // closure), so the worker's queue disconnects before it is joined below.
+    let result = ready_rx
+        .recv()
+        .unwrap_or_else(|_| {
+            Err(Error::IoError(
+                "Inference worker exited before loading the model".into(),
+            ))
+        })
+        .and_then(|()| capture_loop(&ma, &module_id, params, job_tx, &cmd_rx));
+
+    stopping.store(true, Ordering::Relaxed);
+    let _ = worker.join();
+
+    match result {
+        Ok(()) => emit_status(&ma, &module_id, "recording_stopped"),
+        Err(e) => emit_status(&ma, &module_id, format!("error: {}", e)),
+    }
+}
+
+/// Captures from the device and feeds the VAD until `Command::Shutdown` or a stream error.
+fn capture_loop(
+    ma: &ModularAgent,
+    module_id: &str,
+    params: CaptureParams,
+    job_tx: SyncSender<InferJob>,
+    cmd_rx: &Receiver<Command>,
+) -> Result<()> {
+    let CaptureParams {
+        device,
+        vad_sensitivity,
+        min_volume,
+        max_segment_secs,
+        silence_duration_ms,
+        partial_interval_secs,
+    } = params;
 
     // A render endpoint (WASAPI loopback) rejects default_input_config(), but
     // build_input_stream() on it captures the mix being played through it.
@@ -220,18 +378,7 @@ fn processing_thread(
     } else {
         device.default_output_config()
     };
-    let supported_config = match config_result {
-        Ok(c) => c,
-        Err(e) => {
-            emit_output(
-                &ma,
-                &module_id,
-                PORT_STATUS,
-                Value::string(format!("error: {}", e)),
-            );
-            return;
-        }
-    };
+    let supported_config = config_result.map_err(|e| Error::IoError(e.to_string()))?;
     let device_sample_rate = supported_config.sample_rate();
     let device_channels = supported_config.channels() as usize;
 
@@ -242,51 +389,41 @@ fn processing_thread(
     // Error flag for cpal error callback (can't share cmd_tx with the closure)
     let error_flag: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let error_flag_cb = error_flag.clone();
+    // Samples the callback could not push because the ring buffer was full
+    let overrun = Arc::new(AtomicUsize::new(0));
+    let overrun_cb = overrun.clone();
 
-    // Build input stream
     let stream_config = cpal::StreamConfig {
         channels: supported_config.channels(),
         sample_rate: supported_config.sample_rate(),
         buffer_size: cpal::BufferSize::Default,
     };
 
-    let stream = match device.build_input_stream(
-        &stream_config,
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            // Push samples to ring buffer, silently drop on overflow
-            for &sample in data {
-                let _ = producer.push(sample);
-            }
-        },
-        move |err| {
-            log::error!("Audio input stream error: {}", err);
-            if let Ok(mut flag) = error_flag_cb.lock() {
-                *flag = Some(format!("{}", err));
-            }
-        },
-        None,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            emit_output(
-                &ma,
-                &module_id,
-                PORT_STATUS,
-                Value::string(format!("error: {}", e)),
-            );
-            return;
-        }
-    };
+    let stream = device
+        .build_input_stream(
+            &stream_config,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let mut dropped = 0;
+                for &sample in data {
+                    if producer.push(sample).is_err() {
+                        dropped += 1;
+                    }
+                }
+                if dropped > 0 {
+                    overrun_cb.fetch_add(dropped, Ordering::Relaxed);
+                }
+            },
+            move |err| {
+                log::error!("Audio input stream error: {}", err);
+                if let Ok(mut flag) = error_flag_cb.lock() {
+                    *flag = Some(format!("{}", err));
+                }
+            },
+            None,
+        )
+        .map_err(|e| Error::IoError(e.to_string()))?;
 
-    if let Err(e) = stream.play() {
-        emit_output(
-            &ma,
-            &module_id,
-            PORT_STATUS,
-            Value::string(format!("error: {}", e)),
-        );
-        return;
-    }
+    stream.play().map_err(|e| Error::IoError(e.to_string()))?;
 
     // Set up resampler if needed
     let needs_resample = device_sample_rate != WHISPER_SAMPLE_RATE;
@@ -298,31 +435,37 @@ fn processing_thread(
             interpolation: rubato::SincInterpolationType::Linear,
             window: rubato::WindowFunction::BlackmanHarris2,
         };
-        match rubato::SincFixedOut::<f64>::new(
+        let resampler = rubato::SincFixedOut::<f64>::new(
             WHISPER_SAMPLE_RATE as f64 / device_sample_rate as f64,
             2.0,
             params,
             160, // output chunk size: 10ms at 16kHz
             1,   // mono
-        ) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                emit_output(
-                    &ma,
-                    &module_id,
-                    PORT_STATUS,
-                    Value::string(format!("error: resampler init failed: {}", e)),
-                );
-                return;
-            }
-        }
+        )
+        .map_err(|e| Error::IoError(format!("resampler init failed: {}", e)))?;
+        Some(resampler)
     } else {
         None
     };
 
     let initial_sensitivity = *vad_sensitivity.lock().unwrap();
-    let mut vad = EnergyVad::new(WHISPER_SAMPLE_RATE, initial_sensitivity, max_segment_secs);
+    let mut pipeline = SpeechPipeline {
+        ma: ma.clone(),
+        module_id: module_id.to_string(),
+        vad: EnergyVad::new(
+            WHISPER_SAMPLE_RATE,
+            initial_sensitivity,
+            max_segment_secs,
+            silence_duration_ms,
+        ),
+        job_tx,
+        min_volume,
+        partial_interval_samples: (partial_interval_secs.max(0.0) * WHISPER_SAMPLE_RATE as f64)
+            as usize,
+        samples_since_partial: 0,
+    };
     let mut paused = false;
+    let mut in_overrun = false;
     // Read ~10ms of interleaved samples per iteration
     let chunk_size = (device_sample_rate as usize * device_channels) / 100;
     // Buffer for accumulating mono samples before resampling
@@ -346,14 +489,17 @@ fn processing_thread(
         if let Ok(mut flag) = error_flag.lock()
             && let Some(err) = flag.take()
         {
-            emit_output(
-                &ma,
-                &module_id,
-                PORT_STATUS,
-                Value::string(format!("error: {}", err)),
-            );
-            break;
+            return Err(Error::IoError(err));
         }
+
+        let dropped = overrun.swap(0, Ordering::Relaxed);
+        if dropped > 0 {
+            log::warn!("Input overrun: {} samples dropped", dropped);
+            if !in_overrun {
+                emit_status(ma, module_id, "overrun: input samples dropped");
+            }
+        }
+        in_overrun = dropped > 0;
 
         if paused {
             std::thread::sleep(Duration::from_millis(50));
@@ -362,7 +508,7 @@ fn processing_thread(
 
         // Update VAD sensitivity from config
         if let Ok(t) = vad_sensitivity.lock() {
-            vad.set_threshold(*t);
+            pipeline.vad.set_threshold(*t);
         }
 
         // 2. Read from ring buffer
@@ -408,15 +554,7 @@ fn processing_thread(
                         if !output.is_empty() && !output[0].is_empty() {
                             let samples_16k: Vec<f32> =
                                 output[0].iter().map(|&s| s as f32).collect();
-                            process_vad_and_transcribe(
-                                &samples_16k,
-                                &mut vad,
-                                &mut whisper_state,
-                                &language,
-                                &min_volume,
-                                &ma,
-                                &module_id,
-                            );
+                            pipeline.feed(&samples_16k);
                         }
                     }
                     Err(e) => {
@@ -427,32 +565,20 @@ fn processing_thread(
         } else {
             // No resampling needed — feed mono samples directly to VAD
             let samples = std::mem::take(&mut mono_buf);
-            process_vad_and_transcribe(
-                &samples,
-                &mut vad,
-                &mut whisper_state,
-                &language,
-                &min_volume,
-                &ma,
-                &module_id,
-            );
+            pipeline.feed(&samples);
         }
     }
 
     // Stream is dropped here, stopping the cpal callback
     drop(stream);
-    emit_output(
-        &ma,
-        &module_id,
-        PORT_STATUS,
-        Value::string("recording_stopped"),
-    );
+    Ok(())
 }
 
 fn transcribe(
     state: &mut whisper_rs::WhisperState,
     samples: &[f32],
     language: &str,
+    n_threads: i32,
 ) -> Result<String> {
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_language(Some(language));
@@ -462,7 +588,7 @@ fn transcribe(
     params.set_print_timestamps(false);
     params.set_single_segment(true);
     params.set_no_context(true);
-    params.set_n_threads(2);
+    params.set_n_threads(n_threads);
 
     state
         .full(params, samples)
@@ -488,13 +614,15 @@ fn transcribe(
 #[modular_agent(
     title = "Mic Transcribe",
     category = CATEGORY,
-    outputs = [PORT_TEXT, PORT_STATUS],
+    outputs = [PORT_TEXT, PORT_PARTIAL, PORT_STATUS],
     boolean_config(name = CONFIG_ENABLED, default = true, description = "Enable/disable mic capture"),
     string_config(name = CONFIG_DEVICE, description = "Audio input device ID (empty = default mic, \"loopback\" = default output on Windows)"),
     string_config(name = CONFIG_LANGUAGE, default = "ja", detail, description = "Language code for transcription"),
     number_config(name = CONFIG_VAD_SENSITIVITY, default = 0.01, detail, description = "VAD sensitivity (RMS threshold, lower = more sensitive)"),
     number_config(name = CONFIG_MIN_VOLUME, default = 0.0, detail, description = "Minimum peak volume (RMS) to send to Whisper. Utterances below this are discarded. 0 = disabled"),
     integer_config(name = CONFIG_MAX_SEGMENT_DURATION, default = 25, detail, description = "Max segment duration in seconds (Whisper 30s limit)"),
+    integer_config(name = CONFIG_SILENCE_DURATION_MS, default = 800, detail, description = "Trailing silence in milliseconds that ends an utterance (lower = faster finals, more mid-sentence splits)"),
+    number_config(name = CONFIG_PARTIAL_INTERVAL, default = 0.0, detail, description = "Seconds of speech between partial results while an utterance is in progress. 0 = disabled"),
     string_global_config(name = CONFIG_MODEL_PATH, description = "Path to Whisper GGML model file (e.g. ggml-medium.bin)"),
     hint(color = 5, width = 1, height = 1),
 )]
@@ -541,6 +669,10 @@ impl AsModule for MicTranscribeModule {
         let sensitivity = config.get_number_or(CONFIG_VAD_SENSITIVITY, 0.01) as f32;
         let min_vol = (config.get_number_or(CONFIG_MIN_VOLUME, 0.0) as f32).clamp(0.0, 1.0);
         let max_seg = config.get_integer_or(CONFIG_MAX_SEGMENT_DURATION, 25) as u32;
+        let silence_ms = config
+            .get_integer_or(CONFIG_SILENCE_DURATION_MS, 800)
+            .max(0) as u32;
+        let partial_interval = config.get_number_or(CONFIG_PARTIAL_INTERVAL, 0.0);
 
         // Update shared state
         *self.shared_vad_sensitivity.lock().unwrap() = sensitivity;
@@ -553,25 +685,21 @@ impl AsModule for MicTranscribeModule {
         let ma = self.ma().clone();
         let module_id = self.id().to_string();
         let shared_language = self.shared_language.clone();
-        let shared_vad_sensitivity = self.shared_vad_sensitivity.clone();
-        let shared_min_volume = self.shared_min_volume.clone();
+        let params = CaptureParams {
+            device,
+            vad_sensitivity: self.shared_vad_sensitivity.clone(),
+            min_volume: self.shared_min_volume.clone(),
+            max_segment_secs: max_seg,
+            silence_duration_ms: silence_ms,
+            partial_interval_secs: partial_interval,
+        };
 
         let (tx, rx) = std::sync::mpsc::channel();
 
         let handle = std::thread::Builder::new()
             .name(format!("mic-transcribe-{}", module_id))
             .spawn(move || {
-                processing_thread(
-                    ma,
-                    module_id,
-                    device,
-                    model_path,
-                    shared_language,
-                    shared_vad_sensitivity,
-                    shared_min_volume,
-                    max_seg,
-                    rx,
-                );
+                processing_thread(ma, module_id, model_path, shared_language, params, rx);
             })
             .map_err(|e| Error::IoError(format!("Failed to spawn processing thread: {}", e)))?;
 

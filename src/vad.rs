@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 
-const SILENCE_DURATION_MS: u32 = 800;
 const MIN_SPEECH_DURATION_MS: u32 = 300;
 const PRE_SPEECH_DURATION_MS: u32 = 200;
 
@@ -23,8 +22,13 @@ pub struct EnergyVad {
 }
 
 impl EnergyVad {
-    pub fn new(sample_rate: u32, energy_threshold: f32, max_duration_secs: u32) -> Self {
-        let silence_duration_samples = (sample_rate as usize * SILENCE_DURATION_MS as usize) / 1000;
+    pub fn new(
+        sample_rate: u32,
+        energy_threshold: f32,
+        max_duration_secs: u32,
+        silence_duration_ms: u32,
+    ) -> Self {
+        let silence_duration_samples = (sample_rate as usize * silence_duration_ms as usize) / 1000;
         let min_speech_samples = (sample_rate as usize * MIN_SPEECH_DURATION_MS as usize) / 1000;
         let pre_speech_capacity = (sample_rate as usize * PRE_SPEECH_DURATION_MS as usize) / 1000;
         let max_duration_samples = sample_rate as usize * max_duration_secs as usize;
@@ -90,6 +94,20 @@ impl EnergyVad {
 
     pub fn set_threshold(&mut self, threshold: f32) {
         self.energy_threshold = threshold;
+    }
+
+    pub fn is_speaking(&self) -> bool {
+        self.is_speaking
+    }
+
+    /// Audio of the utterance in progress (including the pre-speech lead-in).
+    /// Empty while not speaking.
+    pub fn current_speech(&self) -> &[f32] {
+        if self.is_speaking {
+            &self.speech_buffer
+        } else {
+            &[]
+        }
     }
 
     pub fn reset(&mut self) {
@@ -207,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_silence_only_produces_no_output() {
-        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 25);
+        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 25, 800);
         for _ in 0..100 {
             let chunk = silence(10);
             assert!(vad.process(&chunk).is_none());
@@ -216,7 +234,7 @@ mod tests {
 
     #[test]
     fn test_short_speech_is_filtered() {
-        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 25);
+        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 25, 800);
         // 100ms of speech (< 300ms minimum)
         let speech = tone(100, 0.5, 440.0);
         vad.process(&speech);
@@ -228,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_normal_utterance_detected() {
-        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 25);
+        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 25, 800);
         // 1 second of speech
         let speech = tone(1000, 0.5, 440.0);
         // Feed in 10ms chunks
@@ -247,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_force_split_at_max_duration() {
-        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 3); // 3 second max
+        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 3, 800); // 3 second max
         // Build 4s of speech with a quiet dip at 2.5s so the split point is predictable.
         let mut speech = tone(2500, 0.5, 440.0);
         speech.extend(tone(100, 0.02, 440.0)); // quiet 100ms at 2.5s
@@ -274,7 +292,7 @@ mod tests {
 
     #[test]
     fn test_force_split_carries_over_remainder() {
-        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 2); // 2 second max
+        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 2, 800); // 2 second max
         // Feed 2.5 seconds of speech
         let speech = tone(2500, 0.5, 440.0);
         let mut first_split = None;
@@ -299,7 +317,7 @@ mod tests {
 
     #[test]
     fn test_pre_speech_buffer_included() {
-        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 25);
+        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 25, 800);
         // Feed 200ms of quiet tone (below threshold but nonzero)
         let quiet = vec![0.001; (SAMPLE_RATE as usize * 200) / 1000];
         vad.process(&quiet);
@@ -323,7 +341,7 @@ mod tests {
 
     #[test]
     fn test_reset_clears_state() {
-        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 25);
+        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 25, 800);
         let speech = tone(500, 0.5, 440.0);
         vad.process(&speech);
         assert!(vad.is_speaking);
@@ -336,7 +354,7 @@ mod tests {
 
     #[test]
     fn test_set_threshold() {
-        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.5, 25);
+        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.5, 25, 800);
         // With high threshold, moderate speech should not trigger
         let speech = tone(1000, 0.1, 440.0);
         vad.process(&speech);
@@ -346,6 +364,45 @@ mod tests {
         vad.set_threshold(0.01);
         vad.process(&speech);
         assert!(vad.is_speaking);
+    }
+
+    #[test]
+    fn test_silence_duration_configurable() {
+        // 400ms hangover: 500ms of silence ends the utterance, which 800ms would not.
+        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 25, 400);
+        let speech = tone(1000, 0.1, 440.0);
+        for chunk in speech.chunks(160) {
+            assert!(vad.process(chunk).is_none());
+        }
+        let sil = silence(500);
+        let mut result = None;
+        for chunk in sil.chunks(160) {
+            if let Some(u) = vad.process(chunk) {
+                result = Some(u);
+            }
+        }
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_current_speech_tracks_utterance() {
+        let mut vad = EnergyVad::new(SAMPLE_RATE, 0.01, 25, 800);
+        assert!(!vad.is_speaking());
+        assert!(vad.current_speech().is_empty());
+
+        let speech = tone(500, 0.1, 440.0);
+        for chunk in speech.chunks(160) {
+            vad.process(chunk);
+        }
+        assert!(vad.is_speaking());
+        assert_eq!(vad.current_speech().len(), speech.len());
+
+        let sil = silence(1000);
+        for chunk in sil.chunks(160) {
+            vad.process(chunk);
+        }
+        assert!(!vad.is_speaking());
+        assert!(vad.current_speech().is_empty());
     }
 
     #[test]

@@ -109,6 +109,8 @@ Requires the `transcribe` feature.
 | vad_sensitivity | number | 0.01 | VAD sensitivity (RMS threshold, lower = more sensitive) |
 | min_volume | number | 0.0 | Minimum peak volume (RMS) to send to Whisper. Utterances below this are discarded. 0 = disabled |
 | max_segment_duration | integer | 25 | Max segment duration in seconds (Whisper 30s limit) |
+| silence_duration_ms | integer | 800 | Trailing silence in milliseconds that ends an utterance. Lower values finalize sooner but split mid-sentence more often; 400–500 suits conversational use |
+| partial_interval | number | 0.0 | Seconds of speech between partial results while an utterance is in progress. 0 = disabled. Each partial re-decodes the last 8 s, so enable it (0.5–1.0) only on GPU builds |
 
 ### Global Config
 
@@ -121,7 +123,10 @@ Download models from <https://huggingface.co/ggerganov/whisper.cpp/tree/main>
 ### Ports
 
 - **Output**: `text` — Transcribed text for each detected utterance
-- **Output**: `status` — State changes: `"recording_started"`, `"recording_stopped"`, `"error: ..."`
+- **Output**: `partial` — Interim text for the utterance in progress, emitted every `partial_interval` seconds of speech
+- **Output**: `status` — State changes: `"recording_started"`, `"recording_stopped"`, `"error: ..."`,
+  `"dropped: transcription backlog"` (an utterance was discarded because inference could not keep up),
+  `"overrun: input samples dropped"` (the capture ring buffer overflowed)
 
 ### Loopback capture (Windows)
 
@@ -146,7 +151,7 @@ Loopback reads a copy of the shared-mode mix, so the audio keeps playing through
 ## Architecture
 
 - **Audio Player**: Dedicated OS thread with `mpsc` channel for playback isolation from the async runtime. Communicates via `AudioCommand` messages (Play, SetVolume, Clear, Shutdown).
-- **Mic Transcribe**: OS thread + `rtrb` lock-free ring buffer for real-time audio callback safety. cpal callback → rtrb → processing thread → mono conversion → resample (16kHz) → VAD → Whisper. Runtime config changes (`vad_sensitivity`/`min_volume`/`language`) via `Arc<Mutex>`.
+- **Mic Transcribe**: OS thread + `rtrb` lock-free ring buffer for real-time audio callback safety. cpal callback → rtrb → processing thread → mono conversion → resample (16kHz) → VAD → job queue → inference thread → Whisper. Inference runs on a separate thread so the audio path never stalls; when it falls behind, whole utterances are dropped and reported on `status` rather than losing input samples. Runtime config changes (`vad_sensitivity`/`min_volume`/`language`) via `Arc<Mutex>`.
 
 ## Key Dependencies
 
