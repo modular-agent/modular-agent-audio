@@ -32,7 +32,8 @@ Modular Agent 用のオーディオ再生・デバイス列挙・音声文字起
 | フィーチャー | デフォルト | 説明 |
 | ------------ | ---------- | ---- |
 | `capture` | No | オーディオデバイス列挙とマイクキャプチャ (Audio Device List を有効化) |
-| `transcribe` | No | 音声文字起こし (`capture` を含む、Mic Transcribe を有効化) |
+| `transcribe` | No | Whisper 文字起こしエンジン (`capture` を含む、Mic Transcribe を有効化) |
+| `sherpa` | No | sherpa-onnx エンジン (ReazonSpeech) と Silero VAD (`capture` を含む、Mic Transcribe を有効化) |
 
 ## Audio Player
 
@@ -95,9 +96,29 @@ VoiceVox TTS モジュールの出力と互換性があります。
 
 ## Mic Transcribe
 
-ソースモジュール (入力なし)。マイク音声をキャプチャし、エネルギーベースの VAD で発話を区間検出し、ローカル Whisper (whisper.cpp via whisper-rs) で文字起こしします。
+ソースモジュール (入力なし)。マイク音声をキャプチャし、VAD で発話を区間検出し、Whisper または sherpa-onnx でローカルに文字起こしします。
 
-`transcribe` フィーチャーが必要です。
+`transcribe` フィーチャーか `sherpa` フィーチャー (または両方) が必要です。
+
+### エンジン
+
+| エンジン | フィーチャー | 備考 |
+| -------- | ------------ | ---- |
+| `whisper` | `transcribe` | whisper.cpp via whisper-rs。任意の Whisper GGML モデル。GPU は `transcribe-*` フィーチャーで有効化 |
+| `sherpa` | `sherpa` | sherpa-onnx のオフライン transducer (ReazonSpeech ja-en)。CPU のみで、int8 モデルなら実時間の約 50 倍速 |
+
+`engine` で選択します。両方ビルドされている場合、空は `whisper` です。
+
+`silero_vad_path` を設定すると、エネルギーベース VAD の代わりに Silero VAD を使います (`sherpa` フィーチャーが必要)。どちらのエンジンとも組み合わせ可能で、0.35 秒の無音で発話を確定します。
+
+#### `sherpa` のモデル準備
+
+<https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/> からダウンロードして展開します:
+
+- `sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17.tar.bz2` → 展開先ディレクトリを `sherpa_model_dir` に設定 (int8 ファイルが自動で選ばれる)
+- `silero_vad.onnx` → ファイルパスを `silero_vad_path` に設定
+
+会話エージェント向けの推奨設定: `engine = "sherpa"`、`silero_vad_path` を設定、`partial_interval = 0.5`、`max_segment_duration = 12`。
 
 ### 設定
 
@@ -105,20 +126,24 @@ VoiceVox TTS モジュールの出力と互換性があります。
 | -------- | -- | ------------ | ---- |
 | enabled | boolean | true | マイクキャプチャの有効/無効 |
 | device | string | "" | オーディオ入力デバイス ID (空 = デフォルトマイク、`"loopback"` = Windows のデフォルト出力) |
-| language | string | "ja" | 文字起こしの言語コード |
-| vad_sensitivity | number | 0.01 | VAD 感度 (RMS 閾値、低いほど感度が高い) |
+| engine | string | "" | 文字起こしエンジン: `"whisper"` または `"sherpa"` (空 = ビルドされていれば whisper、なければ sherpa) |
+| language | string | "ja" | 文字起こしの言語コード (Whisper のみ) |
+| vad_sensitivity | number | 0.01 | エネルギー VAD の感度 (RMS 閾値、低いほど感度が高い) |
+| silero_threshold | number | 0.5 | Silero VAD の発話確率閾値 (`silero_vad_path` 設定時に使用) |
 | min_volume | number | 0.0 | Whisper に送る最低ピーク音量 (RMS)。これ未満の発話は破棄される。0 = 無効 |
-| max_segment_duration | integer | 25 | 最大セグメント長 (秒、Whisper 30秒制限) |
-| silence_duration_ms | integer | 800 | 発話終了と判定する末尾無音 (ミリ秒)。小さいほど早く確定するが文中で切れやすい。会話用途では 400〜500 |
-| partial_interval | number | 0.0 | 発話中に途中結果を出す間隔 (発話秒数)。0 = 無効。毎回直近 8 秒を再デコードするので、有効化 (0.5〜1.0) は GPU ビルドでのみ推奨 |
+| max_segment_duration | integer | 25 | 強制分割までの最大セグメント長 (秒)。Whisper の上限は 30、会話用途では 12 |
+| silence_duration_ms | integer | 800 | エネルギー VAD: 発話終了と判定する末尾無音 (ミリ秒)。小さいほど早く確定するが文中で切れやすい。会話用途では 400〜500 |
+| partial_interval | number | 0.0 | 発話中に途中結果を出す間隔 (発話秒数)。0 = 無効。毎回直近 8 秒を再デコードする。`sherpa` なら軽い (0.5)、Whisper は GPU ビルドでのみ推奨 (0.5〜1.0) |
 
 ### グローバル設定
 
 | 設定項目 | 型 | 説明 |
 | -------- | -- | ---- |
-| model_path | string | Whisper GGML モデルファイルのパス (例: ggml-medium.bin) |
+| model_path | string | Whisper: GGML モデルファイルのパス (例: ggml-medium.bin) |
+| sherpa_model_dir | string | sherpa: transducer の encoder/decoder/joiner `.onnx` と `tokens.txt` があるディレクトリ |
+| silero_vad_path | string | `silero_vad.onnx` のパス。空 = エネルギーベース VAD |
 
-モデルは <https://huggingface.co/ggerganov/whisper.cpp/tree/main> からダウンロードできます。
+Whisper モデルは <https://huggingface.co/ggerganov/whisper.cpp/tree/main> からダウンロードできます。モデルの自動ダウンロードは行いません。
 
 ### ポート
 
@@ -147,11 +172,12 @@ Windows では、マイクの代わりに出力デバイスで再生中の音を
 
 - **macOS**: マイク権限のため Info.plist に `NSMicrophoneUsageDescription` が必要
 - **Linux**: `alsa-lib` 開発ヘッダーが必要
+- **`sherpa` フィーチャー**: sherpa-onnx 自体にコンパイラは不要。`sherpa-onnx-sys` が初回ビルド時に GitHub Releases からプリビルトの静的ライブラリ (Windows x64 で約 123 MB) をダウンロードし、`target/` 以下にキャッシュする。オフラインでビルドする場合は `SHERPA_ONNX_ARCHIVE_DIR` にリリースの tarball を置いたディレクトリ、または `SHERPA_ONNX_LIB_DIR` に展開済みの `lib` ディレクトリを指定
 
 ## アーキテクチャ
 
 - **Audio Player**: 非同期ランタイムからの再生分離のため、`mpsc` チャネルを持つ専用 OS スレッドを使用。`AudioCommand` メッセージ (Play, SetVolume, Clear, Shutdown) で通信。
-- **Mic Transcribe**: OS スレッド + `rtrb` ロックフリーリングバッファによるリアルタイムオーディオコールバック安全性。cpal コールバック → rtrb → 処理スレッド → モノラル変換 → リサンプル (16kHz) → VAD → ジョブキュー → 推論スレッド → Whisper。推論は別スレッドで走るため音声経路が止まらない。追い付かないときは入力サンプルを失う代わりに発話単位で破棄し、`status` に報告する。ランタイム設定変更 (`vad_sensitivity`/`min_volume`/`language`) は `Arc<Mutex>` 経由。
+- **Mic Transcribe**: OS スレッド + `rtrb` ロックフリーリングバッファによるリアルタイムオーディオコールバック安全性。cpal コールバック → rtrb → 処理スレッド → モノラル変換 → リサンプル (16kHz) → VAD (エネルギーまたは Silero) → ジョブキュー → 推論スレッド → エンジン (Whisper または sherpa-onnx)。推論は別スレッドで走るため音声経路が止まらない。追い付かないときは入力サンプルを失う代わりに発話単位で破棄し、`status` に報告する。ランタイム設定変更 (`vad_sensitivity`/`min_volume`/`language`) は `Arc<Mutex>` 経由。
 
 ## 主要な依存クレート
 

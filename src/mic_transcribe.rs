@@ -1,7 +1,6 @@
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -10,12 +9,12 @@ use modular_agent_core::{
     AsModule, Error, ModularAgent, Module, ModuleContext, ModuleData, ModuleSpec, ModuleStatus,
     Result, Value, async_trait, modular_agent,
 };
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-use crate::vad::EnergyVad;
+use crate::transcriber::{Engine, EngineSpec, infer_threads};
+use crate::vad::{EnergyVad, Vad};
 
 const CATEGORY: &str = "Audio";
-const WHISPER_SAMPLE_RATE: u32 = 16000;
+const TARGET_SAMPLE_RATE: u32 = 16000;
 
 const PORT_TEXT: &str = "text";
 const PORT_PARTIAL: &str = "partial";
@@ -23,13 +22,17 @@ const PORT_STATUS: &str = "status";
 
 const CONFIG_ENABLED: &str = "enabled";
 const CONFIG_DEVICE: &str = "device";
+const CONFIG_ENGINE: &str = "engine";
 const CONFIG_LANGUAGE: &str = "language";
 const CONFIG_VAD_SENSITIVITY: &str = "vad_sensitivity";
+const CONFIG_SILERO_THRESHOLD: &str = "silero_threshold";
 const CONFIG_MIN_VOLUME: &str = "min_volume";
 const CONFIG_MAX_SEGMENT_DURATION: &str = "max_segment_duration";
 const CONFIG_SILENCE_DURATION_MS: &str = "silence_duration_ms";
 const CONFIG_PARTIAL_INTERVAL: &str = "partial_interval";
 const CONFIG_MODEL_PATH: &str = "model_path";
+const CONFIG_SHERPA_MODEL_DIR: &str = "sherpa_model_dir";
+const CONFIG_SILERO_VAD_PATH: &str = "silero_vad_path";
 
 /// `device` value that selects the default output device as a WASAPI loopback source.
 const DEVICE_LOOPBACK: &str = "loopback";
@@ -50,45 +53,10 @@ enum InferJob {
     Partial(Vec<f32>),
 }
 
-// WhisperContext cache (shared across instances, keyed by model path)
-static WHISPER_CONTEXT_MAP: OnceLock<Mutex<BTreeMap<String, Arc<WhisperContext>>>> =
-    OnceLock::new();
-
-fn get_whisper_context_map() -> &'static Mutex<BTreeMap<String, Arc<WhisperContext>>> {
-    WHISPER_CONTEXT_MAP.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-fn get_or_load_whisper_context(model_path: &str) -> Result<Arc<WhisperContext>> {
-    let mut map = get_whisper_context_map().lock().unwrap();
-    if let Some(ctx) = map.get(model_path) {
-        return Ok(ctx.clone());
-    }
-    let params = WhisperContextParameters::default();
-    log::info!(
-        "Loading Whisper model '{}' (GPU: {})",
-        model_path,
-        cfg!(feature = "_gpu")
-    );
-    let ctx = WhisperContext::new_with_params(model_path, params).map_err(|e| {
-        Error::IoError(format!(
-            "Failed to load Whisper model '{}': {}",
-            model_path, e
-        ))
-    })?;
-    let ctx = Arc::new(ctx);
-    map.insert(model_path.to_string(), ctx.clone());
-    Ok(ctx)
-}
-
-fn get_model_path(ma: &ModularAgent) -> Result<String> {
+fn global_string(ma: &ModularAgent, key: &str) -> Option<String> {
     ma.get_global_configs(MicTranscribeModule::DEF_NAME)
-        .and_then(|cfg| cfg.get_string(CONFIG_MODEL_PATH).ok())
+        .and_then(|cfg| cfg.get_string(key).ok())
         .filter(|p| !p.is_empty())
-        .ok_or_else(|| {
-            Error::InvalidConfig(
-                "Whisper model path not set. Download from https://huggingface.co/ggerganov/whisper.cpp/tree/main".into(),
-            )
-        })
 }
 
 fn emit_output(ma: &ModularAgent, module_id: &str, port: &str, value: Value) {
@@ -154,7 +122,7 @@ fn resolve_device(device_id_str: &str) -> Result<cpal::Device> {
 struct SpeechPipeline {
     ma: ModularAgent,
     module_id: String,
-    vad: EnergyVad,
+    vad: Box<dyn Vad>,
     job_tx: SyncSender<InferJob>,
     min_volume: Arc<Mutex<f32>>,
     /// 0 disables partial results.
@@ -182,7 +150,7 @@ impl SpeechPipeline {
             let speech = self.vad.current_speech();
             let window = speech
                 .len()
-                .min(PARTIAL_WINDOW_SECS * WHISPER_SAMPLE_RATE as usize);
+                .min(PARTIAL_WINDOW_SECS * TARGET_SAMPLE_RATE as usize);
             self.submit(InferJob::Partial(speech[speech.len() - window..].to_vec()));
         }
     }
@@ -192,7 +160,7 @@ impl SpeechPipeline {
         if min_vol <= 0.0 {
             return true;
         }
-        let peak = EnergyVad::peak_rms(utterance, WHISPER_SAMPLE_RATE);
+        let peak = EnergyVad::peak_rms(utterance, TARGET_SAMPLE_RATE);
         if peak < min_vol {
             log::debug!(
                 "Utterance discarded: peak_rms {:.4} < min_volume {:.4}",
@@ -234,36 +202,25 @@ fn skip_stale_partials(job_rx: &Receiver<InferJob>, mut job: InferJob) -> InferJ
     job
 }
 
-fn whisper_n_threads() -> i32 {
-    std::thread::available_parallelism()
-        .map(|n| n.get() / 2)
-        .unwrap_or(2)
-        .clamp(2, 8) as i32
-}
-
-/// Inference worker: owns the Whisper state and decodes jobs from the processing thread.
+/// Inference worker: owns the transcriber and decodes jobs from the processing thread.
 /// Reports the model load result through `ready_tx` before entering the loop.
 fn infer_thread(
     ma: ModularAgent,
     module_id: String,
-    model_path: String,
+    engine: EngineSpec,
     language: Arc<Mutex<String>>,
     stopping: Arc<AtomicBool>,
     ready_tx: SyncSender<Result<()>>,
     job_rx: Receiver<InferJob>,
 ) {
-    let mut whisper_state = match get_or_load_whisper_context(&model_path).and_then(|ctx| {
-        ctx.create_state()
-            .map_err(|e| Error::IoError(format!("Failed to create whisper state: {}", e)))
-    }) {
-        Ok(state) => state,
+    let mut transcriber = match engine.load(infer_threads()) {
+        Ok(t) => t,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
             return;
         }
     };
     let _ = ready_tx.send(Ok(()));
-    let n_threads = whisper_n_threads();
 
     while let Ok(job) = job_rx.recv() {
         if stopping.load(Ordering::Relaxed) {
@@ -274,20 +231,57 @@ fn infer_thread(
             InferJob::Partial(samples) => (PORT_PARTIAL, samples),
         };
         let lang = language.lock().unwrap().clone();
-        match transcribe(&mut whisper_state, &samples, &lang, n_threads) {
+        match transcriber.transcribe(&samples, &lang) {
             Ok(text) if !text.is_empty() => {
                 emit_output(&ma, &module_id, port, Value::string(&text));
             }
             Err(e) => {
-                log::error!("Whisper inference error: {}", e);
+                log::error!("Transcription error: {}", e);
             }
             _ => {}
         }
     }
 }
 
+enum VadSpec {
+    Energy,
+    #[cfg(feature = "sherpa")]
+    Silero {
+        model_path: String,
+        threshold: f32,
+    },
+}
+
+impl VadSpec {
+    fn build(
+        self,
+        sensitivity: f32,
+        max_segment_secs: u32,
+        silence_duration_ms: u32,
+    ) -> Result<Box<dyn Vad>> {
+        match self {
+            VadSpec::Energy => Ok(Box::new(EnergyVad::new(
+                TARGET_SAMPLE_RATE,
+                sensitivity,
+                max_segment_secs,
+                silence_duration_ms,
+            ))),
+            #[cfg(feature = "sherpa")]
+            VadSpec::Silero {
+                model_path,
+                threshold,
+            } => Ok(Box::new(crate::silero_vad::SileroVad::new(
+                &model_path,
+                threshold,
+                max_segment_secs,
+            )?)),
+        }
+    }
+}
+
 struct CaptureParams {
     device: cpal::Device,
+    vad: VadSpec,
     vad_sensitivity: Arc<Mutex<f32>>,
     min_volume: Arc<Mutex<f32>>,
     max_segment_secs: u32,
@@ -299,7 +293,7 @@ struct CaptureParams {
 fn processing_thread(
     ma: ModularAgent,
     module_id: String,
-    model_path: String,
+    engine: EngineSpec,
     language: Arc<Mutex<String>>,
     params: CaptureParams,
     cmd_rx: Receiver<Command>,
@@ -317,9 +311,7 @@ fn processing_thread(
         std::thread::Builder::new()
             .name(format!("mic-transcribe-infer-{}", module_id))
             .spawn(move || {
-                infer_thread(
-                    ma, module_id, model_path, language, stopping, ready_tx, job_rx,
-                )
+                infer_thread(ma, module_id, engine, language, stopping, ready_tx, job_rx)
             })
     };
     let worker = match worker {
@@ -364,6 +356,7 @@ fn capture_loop(
 ) -> Result<()> {
     let CaptureParams {
         device,
+        vad,
         vad_sensitivity,
         min_volume,
         max_segment_secs,
@@ -426,7 +419,7 @@ fn capture_loop(
     stream.play().map_err(|e| Error::IoError(e.to_string()))?;
 
     // Set up resampler if needed
-    let needs_resample = device_sample_rate != WHISPER_SAMPLE_RATE;
+    let needs_resample = device_sample_rate != TARGET_SAMPLE_RATE;
     let mut resampler: Option<rubato::SincFixedOut<f64>> = if needs_resample {
         let params = rubato::SincInterpolationParameters {
             sinc_len: 256,
@@ -436,7 +429,7 @@ fn capture_loop(
             window: rubato::WindowFunction::BlackmanHarris2,
         };
         let resampler = rubato::SincFixedOut::<f64>::new(
-            WHISPER_SAMPLE_RATE as f64 / device_sample_rate as f64,
+            TARGET_SAMPLE_RATE as f64 / device_sample_rate as f64,
             2.0,
             params,
             160, // output chunk size: 10ms at 16kHz
@@ -452,15 +445,10 @@ fn capture_loop(
     let mut pipeline = SpeechPipeline {
         ma: ma.clone(),
         module_id: module_id.to_string(),
-        vad: EnergyVad::new(
-            WHISPER_SAMPLE_RATE,
-            initial_sensitivity,
-            max_segment_secs,
-            silence_duration_ms,
-        ),
+        vad: vad.build(initial_sensitivity, max_segment_secs, silence_duration_ms)?,
         job_tx,
         min_volume,
-        partial_interval_samples: (partial_interval_secs.max(0.0) * WHISPER_SAMPLE_RATE as f64)
+        partial_interval_samples: (partial_interval_secs.max(0.0) * TARGET_SAMPLE_RATE as f64)
             as usize,
         samples_since_partial: 0,
     };
@@ -508,7 +496,7 @@ fn capture_loop(
 
         // Update VAD sensitivity from config
         if let Ok(t) = vad_sensitivity.lock() {
-            pipeline.vad.set_threshold(*t);
+            pipeline.vad.set_energy_threshold(*t);
         }
 
         // 2. Read from ring buffer
@@ -574,56 +562,25 @@ fn capture_loop(
     Ok(())
 }
 
-fn transcribe(
-    state: &mut whisper_rs::WhisperState,
-    samples: &[f32],
-    language: &str,
-    n_threads: i32,
-) -> Result<String> {
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_language(Some(language));
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-    params.set_single_segment(true);
-    params.set_no_context(true);
-    params.set_n_threads(n_threads);
-
-    state
-        .full(params, samples)
-        .map_err(|e| Error::IoError(format!("Whisper inference failed: {}", e)))?;
-
-    let n_segments = state.full_n_segments();
-    let mut text = String::new();
-    for i in 0..n_segments {
-        if let Some(segment) = state.get_segment(i)
-            && let Ok(s) = segment.to_str_lossy()
-        {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                text.push_str(trimmed);
-            }
-        }
-    }
-    Ok(text)
-}
-
-/// Captures microphone audio, detects speech via VAD,
-/// and transcribes with Whisper (whisper.cpp).
+/// Captures microphone audio, detects speech via VAD, and transcribes it
+/// locally with Whisper (whisper.cpp) or sherpa-onnx (ReazonSpeech).
 #[modular_agent(
     title = "Mic Transcribe",
     category = CATEGORY,
     outputs = [PORT_TEXT, PORT_PARTIAL, PORT_STATUS],
     boolean_config(name = CONFIG_ENABLED, default = true, description = "Enable/disable mic capture"),
     string_config(name = CONFIG_DEVICE, description = "Audio input device ID (empty = default mic, \"loopback\" = default output on Windows)"),
-    string_config(name = CONFIG_LANGUAGE, default = "ja", detail, description = "Language code for transcription"),
-    number_config(name = CONFIG_VAD_SENSITIVITY, default = 0.01, detail, description = "VAD sensitivity (RMS threshold, lower = more sensitive)"),
-    number_config(name = CONFIG_MIN_VOLUME, default = 0.0, detail, description = "Minimum peak volume (RMS) to send to Whisper. Utterances below this are discarded. 0 = disabled"),
-    integer_config(name = CONFIG_MAX_SEGMENT_DURATION, default = 25, detail, description = "Max segment duration in seconds (Whisper 30s limit)"),
-    integer_config(name = CONFIG_SILENCE_DURATION_MS, default = 800, detail, description = "Trailing silence in milliseconds that ends an utterance (lower = faster finals, more mid-sentence splits)"),
+    string_config(name = CONFIG_ENGINE, description = "Transcription engine: \"whisper\" or \"sherpa\" (empty = whisper when built in, otherwise sherpa)"),
+    string_config(name = CONFIG_LANGUAGE, default = "ja", detail, description = "Language code for transcription (Whisper only)"),
+    number_config(name = CONFIG_VAD_SENSITIVITY, default = 0.01, detail, description = "Energy VAD sensitivity (RMS threshold, lower = more sensitive)"),
+    number_config(name = CONFIG_SILERO_THRESHOLD, default = 0.5, detail, description = "Silero VAD speech probability threshold (used when silero_vad_path is set)"),
+    number_config(name = CONFIG_MIN_VOLUME, default = 0.0, detail, description = "Minimum peak volume (RMS) to transcribe. Utterances below this are discarded. 0 = disabled"),
+    integer_config(name = CONFIG_MAX_SEGMENT_DURATION, default = 25, detail, description = "Max segment duration in seconds before force-split (Whisper limit is 30; 12 suits conversation)"),
+    integer_config(name = CONFIG_SILENCE_DURATION_MS, default = 800, detail, description = "Energy VAD: trailing silence in milliseconds that ends an utterance (lower = faster finals, more mid-sentence splits)"),
     number_config(name = CONFIG_PARTIAL_INTERVAL, default = 0.0, detail, description = "Seconds of speech between partial results while an utterance is in progress. 0 = disabled"),
-    string_global_config(name = CONFIG_MODEL_PATH, description = "Path to Whisper GGML model file (e.g. ggml-medium.bin)"),
+    string_global_config(name = CONFIG_MODEL_PATH, description = "Whisper: path to a GGML model file (e.g. ggml-medium.bin)"),
+    string_global_config(name = CONFIG_SHERPA_MODEL_DIR, description = "sherpa: directory holding the transducer encoder/decoder/joiner .onnx files and tokens.txt"),
+    string_global_config(name = CONFIG_SILERO_VAD_PATH, description = "Path to silero_vad.onnx. Empty = energy VAD (requires the sherpa feature)"),
     hint(color = 5, width = 1, height = 1),
 )]
 struct MicTranscribeModule {
@@ -633,6 +590,70 @@ struct MicTranscribeModule {
     shared_vad_sensitivity: Arc<Mutex<f32>>,
     shared_min_volume: Arc<Mutex<f32>>,
     shared_language: Arc<Mutex<String>>,
+}
+
+impl MicTranscribeModule {
+    /// Resolves the engine's model files, verifying they exist before any
+    /// thread starts (sherpa-onnx exits the process on a missing file).
+    fn engine_spec(&self, engine: Engine) -> Result<EngineSpec> {
+        match engine {
+            #[cfg(feature = "transcribe")]
+            Engine::Whisper => {
+                let model_path = global_string(self.ma(), CONFIG_MODEL_PATH).ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "Whisper model path not set. Download from https://huggingface.co/ggerganov/whisper.cpp/tree/main".into(),
+                    )
+                })?;
+                if !std::path::Path::new(&model_path).is_file() {
+                    return Err(Error::InvalidConfig(format!(
+                        "Whisper model file not found: {}. Download from https://huggingface.co/ggerganov/whisper.cpp/tree/main",
+                        model_path
+                    )));
+                }
+                Ok(EngineSpec::Whisper { model_path })
+            }
+            #[cfg(feature = "sherpa")]
+            Engine::Sherpa => {
+                let dir = global_string(self.ma(), CONFIG_SHERPA_MODEL_DIR).ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "sherpa_model_dir not set. Download and extract {}",
+                        crate::engine_sherpa::MODEL_DOWNLOAD_URL
+                    ))
+                })?;
+                let files =
+                    crate::engine_sherpa::SherpaModelFiles::locate(std::path::Path::new(&dir))?;
+                Ok(EngineSpec::Sherpa { files })
+            }
+        }
+    }
+
+    fn vad_spec(&self, silero_threshold: f32) -> Result<VadSpec> {
+        let Some(model_path) = global_string(self.ma(), CONFIG_SILERO_VAD_PATH) else {
+            return Ok(VadSpec::Energy);
+        };
+        #[cfg(feature = "sherpa")]
+        {
+            if !std::path::Path::new(&model_path).is_file() {
+                return Err(Error::InvalidConfig(format!(
+                    "Silero VAD model not found: {}. Download from https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+                    model_path
+                )));
+            }
+            Ok(VadSpec::Silero {
+                model_path,
+                threshold: silero_threshold,
+            })
+        }
+        #[cfg(not(feature = "sherpa"))]
+        {
+            let _ = silero_threshold;
+            log::warn!(
+                "silero_vad_path is set ({}) but this build lacks the sherpa feature; using energy VAD",
+                model_path
+            );
+            Ok(VadSpec::Energy)
+        }
+    }
 }
 
 #[async_trait]
@@ -655,24 +676,22 @@ impl AsModule for MicTranscribeModule {
             return Ok(());
         }
 
-        // Validate model path (file existence check only, actual loading on thread)
-        let model_path = get_model_path(self.ma())?;
-        if !std::path::Path::new(&model_path).exists() {
-            return Err(Error::InvalidConfig(format!(
-                "Whisper model file not found: {}. Download from https://huggingface.co/ggerganov/whisper.cpp/tree/main",
-                model_path
-            )));
-        }
+        let engine = Engine::parse(&config.get_string_or_default(CONFIG_ENGINE))?;
+        let engine_spec = self.engine_spec(engine)?;
 
         let device_id = config.get_string_or_default(CONFIG_DEVICE);
         let language = config.get_string_or(CONFIG_LANGUAGE, "ja");
         let sensitivity = config.get_number_or(CONFIG_VAD_SENSITIVITY, 0.01) as f32;
+        let silero_threshold =
+            (config.get_number_or(CONFIG_SILERO_THRESHOLD, 0.5) as f32).clamp(0.0, 1.0);
         let min_vol = (config.get_number_or(CONFIG_MIN_VOLUME, 0.0) as f32).clamp(0.0, 1.0);
         let max_seg = config.get_integer_or(CONFIG_MAX_SEGMENT_DURATION, 25) as u32;
         let silence_ms = config
             .get_integer_or(CONFIG_SILENCE_DURATION_MS, 800)
             .max(0) as u32;
         let partial_interval = config.get_number_or(CONFIG_PARTIAL_INTERVAL, 0.0);
+
+        let vad = self.vad_spec(silero_threshold)?;
 
         // Update shared state
         *self.shared_vad_sensitivity.lock().unwrap() = sensitivity;
@@ -687,6 +706,7 @@ impl AsModule for MicTranscribeModule {
         let shared_language = self.shared_language.clone();
         let params = CaptureParams {
             device,
+            vad,
             vad_sensitivity: self.shared_vad_sensitivity.clone(),
             min_volume: self.shared_min_volume.clone(),
             max_segment_secs: max_seg,
@@ -699,7 +719,7 @@ impl AsModule for MicTranscribeModule {
         let handle = std::thread::Builder::new()
             .name(format!("mic-transcribe-{}", module_id))
             .spawn(move || {
-                processing_thread(ma, module_id, model_path, shared_language, params, rx);
+                processing_thread(ma, module_id, engine_spec, shared_language, params, rx);
             })
             .map_err(|e| Error::IoError(format!("Failed to spawn processing thread: {}", e)))?;
 
@@ -756,7 +776,7 @@ impl AsModule for MicTranscribeModule {
             }
         }
 
-        // Device change requires thread restart (handled by user stopping/starting)
+        // Device / engine / VAD changes require thread restart (handled by user stopping/starting)
 
         Ok(())
     }

@@ -1,5 +1,16 @@
 use std::collections::VecDeque;
 
+/// Splits a 16 kHz mono stream into utterances.
+pub trait Vad {
+    /// Feed samples; returns a completed utterance when one ends.
+    fn process(&mut self, samples: &[f32]) -> Option<Vec<f32>>;
+    fn is_speaking(&self) -> bool;
+    /// Audio of the utterance in progress (empty while not speaking).
+    fn current_speech(&self) -> &[f32];
+    /// Runtime update of the RMS threshold; model-based detectors ignore it.
+    fn set_energy_threshold(&mut self, threshold: f32);
+}
+
 const MIN_SPEECH_DURATION_MS: u32 = 300;
 const PRE_SPEECH_DURATION_MS: u32 = 200;
 
@@ -200,6 +211,24 @@ impl EnergyVad {
         }
         let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
         (sum_sq / samples.len() as f32).sqrt()
+    }
+}
+
+impl Vad for EnergyVad {
+    fn process(&mut self, samples: &[f32]) -> Option<Vec<f32>> {
+        EnergyVad::process(self, samples)
+    }
+
+    fn is_speaking(&self) -> bool {
+        EnergyVad::is_speaking(self)
+    }
+
+    fn current_speech(&self) -> &[f32] {
+        EnergyVad::current_speech(self)
+    }
+
+    fn set_energy_threshold(&mut self, threshold: f32) {
+        self.set_threshold(threshold);
     }
 }
 

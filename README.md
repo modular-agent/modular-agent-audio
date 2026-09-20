@@ -32,7 +32,8 @@ Two changes to add this package to [`modular-agent-desktop`](https://github.com/
 | Feature | Default | Description |
 | ------- | ------- | ----------- |
 | `capture` | No | Audio device enumeration and microphone capture (enables Audio Device List) |
-| `transcribe` | No | Speech-to-text transcription (includes `capture`, enables Mic Transcribe) |
+| `transcribe` | No | Whisper speech-to-text engine (includes `capture`, enables Mic Transcribe) |
+| `sherpa` | No | sherpa-onnx engine (ReazonSpeech) and Silero VAD (includes `capture`, enables Mic Transcribe) |
 
 ## Audio Player
 
@@ -95,9 +96,29 @@ The `id` is a platform-specific unique identifier stable across reboots. Use thi
 
 ## Mic Transcribe
 
-Source module (no inputs). Captures microphone audio, segments speech with energy-based VAD, and transcribes using local Whisper (whisper.cpp via whisper-rs).
+Source module (no inputs). Captures microphone audio, segments speech with a VAD, and transcribes it locally with Whisper or sherpa-onnx.
 
-Requires the `transcribe` feature.
+Requires the `transcribe` feature, the `sherpa` feature, or both.
+
+### Engines
+
+| Engine | Feature | Notes |
+| ------ | ------- | ----- |
+| `whisper` | `transcribe` | whisper.cpp via whisper-rs. Any Whisper GGML model; GPU via the `transcribe-*` features |
+| `sherpa` | `sherpa` | sherpa-onnx offline transducer (ReazonSpeech ja-en). CPU only, about 50x faster than real time with the int8 model |
+
+Set `engine` to pick one; with both features built in, empty means `whisper`.
+
+Silero VAD replaces the energy-based VAD when `silero_vad_path` is set (requires the `sherpa` feature). It works with either engine and ends utterances after 0.35 s of silence.
+
+#### Model setup for `sherpa`
+
+Download and extract from <https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/>:
+
+- `sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17.tar.bz2` → set `sherpa_model_dir` to the extracted directory (int8 files are picked automatically)
+- `silero_vad.onnx` → set `silero_vad_path` to the file
+
+Recommended settings for a conversational agent: `engine = "sherpa"`, `silero_vad_path` set, `partial_interval = 0.5`, `max_segment_duration = 12`.
 
 ### Configuration
 
@@ -105,20 +126,24 @@ Requires the `transcribe` feature.
 | ------ | ---- | ------- | ----------- |
 | enabled | boolean | true | Enable/disable mic capture |
 | device | string | "" | Audio input device ID (empty = default mic, `"loopback"` = default output on Windows) |
-| language | string | "ja" | Language code for transcription |
-| vad_sensitivity | number | 0.01 | VAD sensitivity (RMS threshold, lower = more sensitive) |
+| engine | string | "" | Transcription engine: `"whisper"` or `"sherpa"` (empty = whisper when built in, otherwise sherpa) |
+| language | string | "ja" | Language code for transcription (Whisper only) |
+| vad_sensitivity | number | 0.01 | Energy VAD sensitivity (RMS threshold, lower = more sensitive) |
+| silero_threshold | number | 0.5 | Silero VAD speech probability threshold (used when `silero_vad_path` is set) |
 | min_volume | number | 0.0 | Minimum peak volume (RMS) to send to Whisper. Utterances below this are discarded. 0 = disabled |
-| max_segment_duration | integer | 25 | Max segment duration in seconds (Whisper 30s limit) |
-| silence_duration_ms | integer | 800 | Trailing silence in milliseconds that ends an utterance. Lower values finalize sooner but split mid-sentence more often; 400–500 suits conversational use |
-| partial_interval | number | 0.0 | Seconds of speech between partial results while an utterance is in progress. 0 = disabled. Each partial re-decodes the last 8 s, so enable it (0.5–1.0) only on GPU builds |
+| max_segment_duration | integer | 25 | Max segment duration in seconds before a force-split (Whisper's limit is 30; 12 suits conversational use) |
+| silence_duration_ms | integer | 800 | Energy VAD: trailing silence in milliseconds that ends an utterance. Lower values finalize sooner but split mid-sentence more often; 400–500 suits conversational use |
+| partial_interval | number | 0.0 | Seconds of speech between partial results while an utterance is in progress. 0 = disabled. Each partial re-decodes the last 8 s: cheap with `sherpa` (0.5), Whisper only on GPU builds (0.5–1.0) |
 
 ### Global Config
 
 | Config | Type | Description |
 | ------ | ---- | ----------- |
-| model_path | string | Path to Whisper GGML model file (e.g. ggml-medium.bin) |
+| model_path | string | Whisper: path to a GGML model file (e.g. ggml-medium.bin) |
+| sherpa_model_dir | string | sherpa: directory holding the transducer encoder/decoder/joiner `.onnx` files and `tokens.txt` |
+| silero_vad_path | string | Path to `silero_vad.onnx`. Empty = energy-based VAD |
 
-Download models from <https://huggingface.co/ggerganov/whisper.cpp/tree/main>
+Whisper models: <https://huggingface.co/ggerganov/whisper.cpp/tree/main>. Models are never downloaded automatically.
 
 ### Ports
 
@@ -147,11 +172,12 @@ Loopback reads a copy of the shared-mode mix, so the audio keeps playing through
 
 - **macOS**: `NSMicrophoneUsageDescription` in Info.plist for mic permission
 - **Linux**: `alsa-lib` dev headers required
+- **`sherpa` feature**: no compiler needed for sherpa-onnx itself. `sherpa-onnx-sys` downloads a prebuilt static library from GitHub Releases on first build (about 123 MB on Windows x64) and caches it under `target/`. For offline builds set `SHERPA_ONNX_ARCHIVE_DIR` to a directory holding the release tarball, or `SHERPA_ONNX_LIB_DIR` to an extracted `lib` directory
 
 ## Architecture
 
 - **Audio Player**: Dedicated OS thread with `mpsc` channel for playback isolation from the async runtime. Communicates via `AudioCommand` messages (Play, SetVolume, Clear, Shutdown).
-- **Mic Transcribe**: OS thread + `rtrb` lock-free ring buffer for real-time audio callback safety. cpal callback → rtrb → processing thread → mono conversion → resample (16kHz) → VAD → job queue → inference thread → Whisper. Inference runs on a separate thread so the audio path never stalls; when it falls behind, whole utterances are dropped and reported on `status` rather than losing input samples. Runtime config changes (`vad_sensitivity`/`min_volume`/`language`) via `Arc<Mutex>`.
+- **Mic Transcribe**: OS thread + `rtrb` lock-free ring buffer for real-time audio callback safety. cpal callback → rtrb → processing thread → mono conversion → resample (16kHz) → VAD (energy or Silero) → job queue → inference thread → engine (Whisper or sherpa-onnx). Inference runs on a separate thread so the audio path never stalls; when it falls behind, whole utterances are dropped and reported on `status` rather than losing input samples. Runtime config changes (`vad_sensitivity`/`min_volume`/`language`) via `Arc<Mutex>`.
 
 ## Key Dependencies
 

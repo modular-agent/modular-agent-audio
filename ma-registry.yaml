@@ -3,10 +3,11 @@ description: Audio capture/transcription modules
 available_features:
   - capture
   - transcribe
+  - sherpa
   - transcribe-cuda
   - transcribe-vulkan
   - transcribe-metal
   - transcribe-coreml
 default_features:
-  - transcribe-cuda
+  - sherpa
 default_for: [desktop]

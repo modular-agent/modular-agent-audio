@@ -16,14 +16,16 @@ rodio = "0.22"
 cpal = { version = "0.17", optional = true }
 rtrb = { version = "0.3", optional = true }
 
-# Transcription (optional)
+# Transcription engines (optional)
 whisper-rs = { version = "0.15", optional = true }
+sherpa-onnx = { version = "1.13", optional = true }
 rubato = { version = "0.14", optional = true }
 
 [features]
 default = []
 capture = ["cpal", "rtrb"]
 transcribe = ["capture", "whisper-rs", "rubato"]
+sherpa = ["capture", "sherpa-onnx", "rubato"]
 _gpu = []
 transcribe-cuda = ["transcribe", "whisper-rs/cuda", "_gpu"]
 transcribe-vulkan = ["transcribe", "whisper-rs/vulkan", "_gpu"]
