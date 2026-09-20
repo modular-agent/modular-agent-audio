@@ -104,7 +104,7 @@ fn resolve_device(device_id_str: &str) -> Result<cpal::Device> {
                     let name = d
                         .description()
                         .ok()
-                        .map(|desc| desc.name().to_string())
+                        .map(|desc| crate::device_list::display_name(&desc))
                         .unwrap_or_default();
                     Some(format!("{} ({})", id, name))
                 })

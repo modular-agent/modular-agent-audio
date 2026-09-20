@@ -9,6 +9,18 @@ const CATEGORY: &str = "Audio";
 const PORT_UNIT: &str = "unit";
 const PORT_DEVICES: &str = "devices";
 
+/// Builds a user-facing device name that stays unique across same-named endpoints.
+///
+/// cpal 0.17 splits the Windows friendly name into `name` (e.g. "マイク") and
+/// `driver` (e.g. "Wireless Microphone RX"), so several devices can share a
+/// bare `name`. Recombining them matches what the OS sound settings show.
+pub(crate) fn display_name(desc: &cpal::DeviceDescription) -> String {
+    match desc.driver() {
+        Some(driver) if driver != desc.name() => format!("{} ({})", desc.name(), driver),
+        _ => desc.name().to_string(),
+    }
+}
+
 /// Lists available audio input devices.
 ///
 /// Receives any value as a trigger and outputs an array of objects
@@ -44,7 +56,7 @@ impl AsModule for AudioDeviceListModule {
                 let desc = d.description().ok()?;
                 Some(Value::object(im::hashmap! {
                     "id".into() => Value::string(id.to_string()),
-                    "name".into() => Value::string(desc.name()),
+                    "name".into() => Value::string(display_name(&desc)),
                 }))
             })
             .collect();
