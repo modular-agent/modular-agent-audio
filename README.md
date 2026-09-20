@@ -107,7 +107,7 @@ Requires the `transcribe` feature, the `sherpa` feature, or both.
 | `whisper` | `transcribe` | whisper.cpp via whisper-rs. Any Whisper GGML model; GPU via the `transcribe-*` features |
 | `sherpa` | `sherpa` | sherpa-onnx offline transducer (ReazonSpeech ja-en). CPU only, about 50x faster than real time with the int8 model |
 
-Set `engine` to pick one; with both features built in, empty means `whisper`.
+Set `engine` to pick one; with both features built in, empty means `sherpa`.
 
 Silero VAD replaces the energy-based VAD when `silero_vad_path` is set (requires the `sherpa` feature). It works with either engine and ends utterances after 0.35 s of silence.
 
@@ -118,7 +118,7 @@ Download and extract from <https://github.com/k2-fsa/sherpa-onnx/releases/downlo
 - `sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17.tar.bz2` → set `sherpa_model_dir` to the extracted directory (int8 files are picked automatically)
 - `silero_vad.onnx` → set `silero_vad_path` to the file
 
-Recommended settings for a conversational agent: `engine = "sherpa"`, `silero_vad_path` set, `partial_interval = 0.5`, `max_segment_duration = 12`.
+Recommended settings for a conversational agent: `silero_vad_path` set, `partial_interval = 0.5`, `max_segment_duration = 12`.
 
 ### Configuration
 
@@ -126,7 +126,7 @@ Recommended settings for a conversational agent: `engine = "sherpa"`, `silero_va
 | ------ | ---- | ------- | ----------- |
 | enabled | boolean | true | Enable/disable mic capture |
 | device | string | "" | Audio input device ID (empty = default mic, `"loopback"` = default output on Windows) |
-| engine | string | "" | Transcription engine: `"whisper"` or `"sherpa"` (empty = whisper when built in, otherwise sherpa) |
+| engine | string | "" | Transcription engine: `"sherpa"` or `"whisper"` (empty = sherpa when built in, otherwise whisper) |
 | language | string | "ja" | Language code for transcription (Whisper only) |
 | vad_sensitivity | number | 0.01 | Energy VAD sensitivity (RMS threshold, lower = more sensitive) |
 | silero_threshold | number | 0.5 | Silero VAD speech probability threshold (used when `silero_vad_path` is set) |

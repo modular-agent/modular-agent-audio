@@ -570,7 +570,7 @@ fn capture_loop(
     outputs = [PORT_TEXT, PORT_PARTIAL, PORT_STATUS],
     boolean_config(name = CONFIG_ENABLED, default = true, description = "Enable/disable mic capture"),
     string_config(name = CONFIG_DEVICE, description = "Audio input device ID (empty = default mic, \"loopback\" = default output on Windows)"),
-    string_config(name = CONFIG_ENGINE, description = "Transcription engine: \"whisper\" or \"sherpa\" (empty = whisper when built in, otherwise sherpa)"),
+    string_config(name = CONFIG_ENGINE, description = "Transcription engine: \"sherpa\" or \"whisper\" (empty = sherpa when built in, otherwise whisper)"),
     string_config(name = CONFIG_LANGUAGE, default = "ja", detail, description = "Language code for transcription (Whisper only)"),
     number_config(name = CONFIG_VAD_SENSITIVITY, default = 0.01, detail, description = "Energy VAD sensitivity (RMS threshold, lower = more sensitive)"),
     number_config(name = CONFIG_SILERO_THRESHOLD, default = 0.5, detail, description = "Silero VAD speech probability threshold (used when silero_vad_path is set)"),
@@ -581,7 +581,7 @@ fn capture_loop(
     string_global_config(name = CONFIG_MODEL_PATH, description = "Whisper: path to a GGML model file (e.g. ggml-medium.bin)"),
     string_global_config(name = CONFIG_SHERPA_MODEL_DIR, description = "sherpa: directory holding the transducer encoder/decoder/joiner .onnx files and tokens.txt"),
     string_global_config(name = CONFIG_SILERO_VAD_PATH, description = "Path to silero_vad.onnx. Empty = energy VAD (requires the sherpa feature)"),
-    hint(color = 5, width = 1, height = 1),
+    hint(color = 5, width = 1, height = 2),
 )]
 struct MicTranscribeModule {
     data: ModuleData,

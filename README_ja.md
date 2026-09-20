@@ -107,7 +107,7 @@ VoiceVox TTS モジュールの出力と互換性があります。
 | `whisper` | `transcribe` | whisper.cpp via whisper-rs。任意の Whisper GGML モデル。GPU は `transcribe-*` フィーチャーで有効化 |
 | `sherpa` | `sherpa` | sherpa-onnx のオフライン transducer (ReazonSpeech ja-en)。CPU のみで、int8 モデルなら実時間の約 50 倍速 |
 
-`engine` で選択します。両方ビルドされている場合、空は `whisper` です。
+`engine` で選択します。両方ビルドされている場合、空は `sherpa` です。
 
 `silero_vad_path` を設定すると、エネルギーベース VAD の代わりに Silero VAD を使います (`sherpa` フィーチャーが必要)。どちらのエンジンとも組み合わせ可能で、0.35 秒の無音で発話を確定します。
 
@@ -118,7 +118,7 @@ VoiceVox TTS モジュールの出力と互換性があります。
 - `sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17.tar.bz2` → 展開先ディレクトリを `sherpa_model_dir` に設定 (int8 ファイルが自動で選ばれる)
 - `silero_vad.onnx` → ファイルパスを `silero_vad_path` に設定
 
-会話エージェント向けの推奨設定: `engine = "sherpa"`、`silero_vad_path` を設定、`partial_interval = 0.5`、`max_segment_duration = 12`。
+会話エージェント向けの推奨設定: `silero_vad_path` を設定、`partial_interval = 0.5`、`max_segment_duration = 12`。
 
 ### 設定
 
@@ -126,7 +126,7 @@ VoiceVox TTS モジュールの出力と互換性があります。
 | -------- | -- | ------------ | ---- |
 | enabled | boolean | true | マイクキャプチャの有効/無効 |
 | device | string | "" | オーディオ入力デバイス ID (空 = デフォルトマイク、`"loopback"` = Windows のデフォルト出力) |
-| engine | string | "" | 文字起こしエンジン: `"whisper"` または `"sherpa"` (空 = ビルドされていれば whisper、なければ sherpa) |
+| engine | string | "" | 文字起こしエンジン: `"sherpa"` または `"whisper"` (空 = ビルドされていれば sherpa、なければ whisper) |
 | language | string | "ja" | 文字起こしの言語コード (Whisper のみ) |
 | vad_sensitivity | number | 0.01 | エネルギー VAD の感度 (RMS 閾値、低いほど感度が高い) |
 | silero_threshold | number | 0.5 | Silero VAD の発話確率閾値 (`silero_vad_path` 設定時に使用) |

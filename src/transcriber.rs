@@ -26,7 +26,7 @@ pub(crate) enum Engine {
 }
 
 impl Engine {
-    /// Empty selects Whisper when it is compiled in, otherwise sherpa-onnx.
+    /// Empty selects sherpa-onnx when it is compiled in, otherwise Whisper.
     pub(crate) fn parse(name: &str) -> Result<Self> {
         match name {
             "" => Ok(Self::default_engine()),
@@ -43,13 +43,13 @@ impl Engine {
     }
 
     fn default_engine() -> Self {
-        #[cfg(feature = "transcribe")]
-        {
-            Self::Whisper
-        }
-        #[cfg(not(feature = "transcribe"))]
+        #[cfg(feature = "sherpa")]
         {
             Self::Sherpa
+        }
+        #[cfg(not(feature = "sherpa"))]
+        {
+            Self::Whisper
         }
     }
 }
