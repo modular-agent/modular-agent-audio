@@ -7,7 +7,7 @@ Modular Agent 用のオーディオ再生・デバイス列挙・音声文字起
 ## 機能
 
 - **Audio Player** — デフォルトのオーディオ出力デバイスを通じてオーディオデータ URI を再生
-- **Audio Device List** — 利用可能なオーディオ入力デバイスの一覧をユニーク ID と名前付きで取得
+- **Audio Device List** — 利用可能なオーディオキャプチャデバイス (Windows ではループバックソースも) の一覧をユニーク ID と名前付きで取得
 - **Mic Transcribe** — マイク音声をキャプチャし、VAD で発話を検出、Whisper で文字起こし
 
 ## インストール
@@ -72,7 +72,7 @@ VoiceVox TTS モジュールの出力と互換性があります。
 
 ## Audio Device List
 
-利用可能なオーディオ入力デバイスを一覧表示します。任意の値をトリガーとして受け取り、`id` (ユニークなデバイス識別子) と `name` (人間が読める名前) を持つオブジェクトの配列を出力します。
+利用可能なオーディオキャプチャデバイスを一覧表示します。任意の値をトリガーとして受け取り、`id` (ユニークなデバイス識別子)、`name` (人間が読める名前)、`kind` (`"input"` または `"loopback"`) を持つオブジェクトの配列を出力します。Windows では出力デバイスが `"loopback"` エントリとして末尾に追加されます。[ループバックキャプチャ (Windows)](#ループバックキャプチャ-windows) を参照してください。
 
 `capture` フィーチャーが必要です。
 
@@ -85,8 +85,9 @@ VoiceVox TTS モジュールの出力と互換性があります。
 
 ```json
 [
-  { "id": "wasapi:{0.0.1.00000000}.{guid}", "name": "Microphone (USB Audio)" },
-  { "id": "wasapi:{0.0.1.00000000}.{guid}", "name": "Headset Microphone" }
+  { "id": "wasapi:{0.0.1.00000000}.{guid}", "name": "Microphone (USB Audio)", "kind": "input" },
+  { "id": "wasapi:{0.0.1.00000000}.{guid}", "name": "Headset Microphone", "kind": "input" },
+  { "id": "wasapi:{0.0.0.00000000}.{guid}", "name": "スピーカー (Realtek Audio)", "kind": "loopback" }
 ]
 ```
 
@@ -103,7 +104,7 @@ VoiceVox TTS モジュールの出力と互換性があります。
 | 設定項目 | 型 | デフォルト値 | 説明 |
 | -------- | -- | ------------ | ---- |
 | enabled | boolean | true | マイクキャプチャの有効/無効 |
-| device | string | "" | オーディオ入力デバイス ID (空 = デフォルト) |
+| device | string | "" | オーディオ入力デバイス ID (空 = デフォルトマイク、`"loopback"` = Windows のデフォルト出力) |
 | language | string | "ja" | 文字起こしの言語コード |
 | vad_sensitivity | number | 0.01 | VAD 感度 (RMS 閾値、低いほど感度が高い) |
 | min_volume | number | 0.0 | Whisper に送る最低ピーク音量 (RMS)。これ未満の発話は破棄される。0 = 無効 |
@@ -121,6 +122,12 @@ VoiceVox TTS モジュールの出力と互換性があります。
 
 - **出力**: `text` — 検出された発話ごとの文字起こしテキスト
 - **出力**: `status` — 状態変化: `"recording_started"`, `"recording_stopped"`, `"error: ..."`
+
+### ループバックキャプチャ (Windows)
+
+Windows では、マイクの代わりに出力デバイスで再生中の音を文字起こしできます (WASAPI ループバック)。`device` に `"loopback"` を設定するとデフォルト出力デバイスに追従し、Audio Device List の `"loopback"` エントリの `id` を設定すると特定の出力デバイスを選べます。
+
+ループバックは共有モードのミックスの複製を読むだけなので、スピーカーからは通常どおり音が出続けます。何も再生されていない間はデータが届かないため、`text` は音が再生されるまで出力されません。WASAPI 排他モードで再生しているアプリの音はキャプチャできません。Windows 以外のプラットフォームでは `"loopback"` は設定エラーになります。
 
 ### ビルド要件
 

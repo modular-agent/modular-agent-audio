@@ -7,7 +7,7 @@ English | [日本語](README_ja.md)
 ## Features
 
 - **Audio Player** — Play audio data URIs through the default audio output device
-- **Audio Device List** — List available audio input devices with unique IDs and names
+- **Audio Device List** — List available audio capture devices (plus loopback sources on Windows) with unique IDs and names
 - **Mic Transcribe** — Capture microphone audio, detect speech via VAD, and transcribe with Whisper
 
 ## Installation
@@ -72,7 +72,7 @@ Auto-detected by the decoder.
 
 ## Audio Device List
 
-Lists available audio input devices. Receives any value as a trigger and outputs an array of objects with `id` (unique device identifier) and `name` (human-readable name).
+Lists available audio capture devices. Receives any value as a trigger and outputs an array of objects with `id` (unique device identifier), `name` (human-readable name), and `kind` (`"input"` or `"loopback"`). On Windows, output devices are appended as `"loopback"` entries; see [Loopback capture (Windows)](#loopback-capture-windows).
 
 Requires the `capture` feature.
 
@@ -85,8 +85,9 @@ Requires the `capture` feature.
 
 ```json
 [
-  { "id": "wasapi:{0.0.1.00000000}.{guid}", "name": "Microphone (USB Audio)" },
-  { "id": "wasapi:{0.0.1.00000000}.{guid}", "name": "Headset Microphone" }
+  { "id": "wasapi:{0.0.1.00000000}.{guid}", "name": "Microphone (USB Audio)", "kind": "input" },
+  { "id": "wasapi:{0.0.1.00000000}.{guid}", "name": "Headset Microphone", "kind": "input" },
+  { "id": "wasapi:{0.0.0.00000000}.{guid}", "name": "Speakers (Realtek Audio)", "kind": "loopback" }
 ]
 ```
 
@@ -103,7 +104,7 @@ Requires the `transcribe` feature.
 | Config | Type | Default | Description |
 | ------ | ---- | ------- | ----------- |
 | enabled | boolean | true | Enable/disable mic capture |
-| device | string | "" | Audio input device ID (empty = default) |
+| device | string | "" | Audio input device ID (empty = default mic, `"loopback"` = default output on Windows) |
 | language | string | "ja" | Language code for transcription |
 | vad_sensitivity | number | 0.01 | VAD sensitivity (RMS threshold, lower = more sensitive) |
 | min_volume | number | 0.0 | Minimum peak volume (RMS) to send to Whisper. Utterances below this are discarded. 0 = disabled |
@@ -121,6 +122,12 @@ Download models from <https://huggingface.co/ggerganov/whisper.cpp/tree/main>
 
 - **Output**: `text` — Transcribed text for each detected utterance
 - **Output**: `status` — State changes: `"recording_started"`, `"recording_stopped"`, `"error: ..."`
+
+### Loopback capture (Windows)
+
+On Windows, Mic Transcribe can transcribe whatever is being played through an output device instead of a microphone (WASAPI loopback). Set `device` to `"loopback"` to follow the default output device, or to the `id` of a `"loopback"` entry from Audio Device List to pick a specific one.
+
+Loopback reads a copy of the shared-mode mix, so the audio keeps playing through the speakers as usual. Nothing is delivered while no audio is playing, so `text` stays silent until something is played. Audio from applications using WASAPI exclusive mode is not captured. Other platforms reject `"loopback"` with a config error.
 
 ### Build Requirements
 

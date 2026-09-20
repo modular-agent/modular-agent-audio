@@ -21,10 +21,26 @@ pub(crate) fn display_name(desc: &cpal::DeviceDescription) -> String {
     }
 }
 
-/// Lists available audio input devices.
+const KIND_INPUT: &str = "input";
+const KIND_LOOPBACK: &str = "loopback";
+
+fn device_entry(device: &cpal::Device, kind: &str) -> Option<Value> {
+    let id = device.id().ok()?;
+    let desc = device.description().ok()?;
+    Some(Value::object(im::hashmap! {
+        "id".into() => Value::string(id.to_string()),
+        "name".into() => Value::string(display_name(&desc)),
+        "kind".into() => Value::string(kind),
+    }))
+}
+
+/// Lists available audio capture devices.
 ///
 /// Receives any value as a trigger and outputs an array of objects
-/// with `id` (unique device identifier) and `name` (human-readable name).
+/// with `id` (unique device identifier), `name` (human-readable name),
+/// and `kind` (`"input"` or `"loopback"`). On Windows, output devices are
+/// included as `"loopback"` entries: passing their `id` to Mic Transcribe
+/// captures whatever is being played through them (WASAPI loopback).
 #[modular_agent(
     title = "Audio Device List",
     category = CATEGORY,
@@ -50,16 +66,18 @@ impl AsModule for AudioDeviceListModule {
             .input_devices()
             .map_err(|e| Error::IoError(format!("Failed to enumerate input devices: {}", e)))?;
 
-        let device_list: im::Vector<Value> = devices
-            .filter_map(|d| {
-                let id = d.id().ok()?;
-                let desc = d.description().ok()?;
-                Some(Value::object(im::hashmap! {
-                    "id".into() => Value::string(id.to_string()),
-                    "name".into() => Value::string(display_name(&desc)),
-                }))
-            })
+        let mut device_list: im::Vector<Value> = devices
+            .filter_map(|d| device_entry(&d, KIND_INPUT))
             .collect();
+
+        // WASAPI is the only cpal backend that opens a render endpoint as a
+        // loopback input, so output devices are only useful on Windows.
+        if cfg!(target_os = "windows") {
+            let outputs = host.output_devices().map_err(|e| {
+                Error::IoError(format!("Failed to enumerate output devices: {}", e))
+            })?;
+            device_list.extend(outputs.filter_map(|d| device_entry(&d, KIND_LOOPBACK)));
+        }
 
         self.output(ctx, PORT_DEVICES, Value::array(device_list))
             .await

@@ -26,6 +26,9 @@ const CONFIG_MIN_VOLUME: &str = "min_volume";
 const CONFIG_MAX_SEGMENT_DURATION: &str = "max_segment_duration";
 const CONFIG_MODEL_PATH: &str = "model_path";
 
+/// `device` value that selects the default output device as a WASAPI loopback source.
+const DEVICE_LOOPBACK: &str = "loopback";
+
 enum Command {
     Pause,
     Resume,
@@ -90,6 +93,16 @@ fn resolve_device(device_id_str: &str) -> Result<cpal::Device> {
         return host
             .default_input_device()
             .ok_or_else(|| Error::IoError("No default audio input device available".into()));
+    }
+    if device_id_str == DEVICE_LOOPBACK {
+        if !cfg!(target_os = "windows") {
+            return Err(Error::InvalidConfig(
+                "Loopback capture is only supported on Windows (WASAPI)".into(),
+            ));
+        }
+        return host
+            .default_output_device()
+            .ok_or_else(|| Error::IoError("No default audio output device available".into()));
     }
     let device_id: cpal::DeviceId = device_id_str.parse().map_err(|e| {
         Error::InvalidConfig(format!("Invalid device ID '{}': {}", device_id_str, e))
@@ -200,8 +213,14 @@ fn processing_thread(
         }
     };
 
-    // Get device config
-    let supported_config = match device.default_input_config() {
+    // A render endpoint (WASAPI loopback) rejects default_input_config(), but
+    // build_input_stream() on it captures the mix being played through it.
+    let config_result = if device.supports_input() {
+        device.default_input_config()
+    } else {
+        device.default_output_config()
+    };
+    let supported_config = match config_result {
         Ok(c) => c,
         Err(e) => {
             emit_output(
@@ -471,7 +490,7 @@ fn transcribe(
     category = CATEGORY,
     outputs = [PORT_TEXT, PORT_STATUS],
     boolean_config(name = CONFIG_ENABLED, default = true, description = "Enable/disable mic capture"),
-    string_config(name = CONFIG_DEVICE, description = "Audio input device ID (empty = default)"),
+    string_config(name = CONFIG_DEVICE, description = "Audio input device ID (empty = default mic, \"loopback\" = default output on Windows)"),
     string_config(name = CONFIG_LANGUAGE, default = "ja", detail, description = "Language code for transcription"),
     number_config(name = CONFIG_VAD_SENSITIVITY, default = 0.01, detail, description = "VAD sensitivity (RMS threshold, lower = more sensitive)"),
     number_config(name = CONFIG_MIN_VOLUME, default = 0.0, detail, description = "Minimum peak volume (RMS) to send to Whisper. Utterances below this are discarded. 0 = disabled"),
