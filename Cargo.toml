@@ -7,19 +7,19 @@ edition = "2024"
 license = "Apache-2.0 OR MIT"
 
 [dependencies]
-base64 = "0.22.1"
+base64 = "0.23"
 log = "0.4"
 modular-agent-core = { path = "../../crates/modular-agent-core" }
-rodio = "0.22"
+rodio = "0.23"
 
 # Mic capture (optional)
-cpal = { version = "0.17", optional = true }
+cpal = { version = "0.18", optional = true }
 rtrb = { version = "0.3", optional = true }
 
 # Transcription engines (optional)
-whisper-rs = { version = "0.15", optional = true }
-sherpa-onnx = { version = "1.13", optional = true }
-rubato = { version = "0.14", optional = true }
+whisper-rs = { version = "0.16", optional = true }
+sherpa-onnx = { version = "2", optional = true }
+rubato = { version = "5", optional = true }
 
 [features]
 default = []

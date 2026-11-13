@@ -394,7 +394,7 @@ fn capture_loop(
 
     let stream = device
         .build_input_stream(
-            &stream_config,
+            stream_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 let mut dropped = 0;
                 for &sample in data {
@@ -406,7 +406,13 @@ fn capture_loop(
                     overrun_cb.fetch_add(dropped, Ordering::Relaxed);
                 }
             },
-            move |err| {
+            move |err: cpal::Error| {
+                // cpal 0.18 reports buffer xruns through this callback; they are
+                // recoverable, so stopping the capture on one would be wrong.
+                if err.kind() == cpal::ErrorKind::Xrun {
+                    log::warn!("Audio input stream xrun");
+                    return;
+                }
                 log::error!("Audio input stream error: {}", err);
                 if let Ok(mut flag) = error_flag_cb.lock() {
                     *flag = Some(format!("{}", err));
@@ -420,20 +426,21 @@ fn capture_loop(
 
     // Set up resampler if needed
     let needs_resample = device_sample_rate != TARGET_SAMPLE_RATE;
-    let mut resampler: Option<rubato::SincFixedOut<f64>> = if needs_resample {
+    let mut resampler: Option<rubato::Async<f64>> = if needs_resample {
         let params = rubato::SincInterpolationParameters {
             sinc_len: 256,
-            f_cutoff: 0.95,
+            f_cutoff: Some(0.95),
             oversampling_factor: 128,
             interpolation: rubato::SincInterpolationType::Linear,
             window: rubato::WindowFunction::BlackmanHarris2,
         };
-        let resampler = rubato::SincFixedOut::<f64>::new(
+        let resampler = rubato::Async::<f64>::new_sinc(
             TARGET_SAMPLE_RATE as f64 / device_sample_rate as f64,
             2.0,
-            params,
+            &params,
             160, // output chunk size: 10ms at 16kHz
             1,   // mono
+            rubato::FixedAsync::Output,
         )
         .map_err(|e| Error::IoError(format!("resampler init failed: {}", e)))?;
         Some(resampler)
@@ -537,11 +544,15 @@ fn capture_loop(
                 let needed = resampler.input_frames_next();
                 let input_f64: Vec<f64> = mono_buf[..needed].iter().map(|&s| s as f64).collect();
                 mono_buf.drain(..needed);
-                match resampler.process(&[input_f64], None) {
+                let input = rubato::audioadapter_buffers::direct::InterleavedSlice::new(
+                    &input_f64, 1, needed,
+                )
+                .map_err(|e| Error::IoError(format!("resampler input: {}", e)))?;
+                match resampler.process(&input, None) {
                     Ok(output) => {
-                        if !output.is_empty() && !output[0].is_empty() {
-                            let samples_16k: Vec<f32> =
-                                output[0].iter().map(|&s| s as f32).collect();
+                        let samples_16k: Vec<f32> =
+                            output.take_data().into_iter().map(|s| s as f32).collect();
+                        if !samples_16k.is_empty() {
                             pipeline.feed(&samples_16k);
                         }
                     }
